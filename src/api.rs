@@ -84,7 +84,7 @@ impl GtfsClient {
 
                     // Get timestamp (prefer vehicle timestamp, fallback to feed header)
                     let timestamp = vehicle.timestamp.unwrap_or_else(|| {
-                        feed.header.timestamp.unwrap_or(0) as u64
+                        feed.header.timestamp.unwrap_or(0)
                     }) as i64;
 
                     let mut obs = BusObservation::new(

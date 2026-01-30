@@ -37,11 +37,11 @@ async fn main() -> Result<()> {
         "Database initialized with existing data"
     );
 
-    // Polling interval: 60 seconds
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    // Polling interval: 15 seconds
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
     let mut poll_count = 0;
 
-    tracing::info!("Starting polling loop (60 second interval)");
+    tracing::info!("Starting polling loop (15 second interval)");
     tracing::info!("");
 
     loop {

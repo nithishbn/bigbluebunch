@@ -19,3 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 prost-build = "0.12"
+
+[[bin]]
+name = "debug_feed"
+path = "debug_feed.rs"
