@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use prost::Message;
-use crate::models::{BusObservation, PollStats};
+use crate::models::{TripUpdate, StopTimeUpdate, StopTimeEvent};
 
 // Include the generated protobuf code
 pub mod gtfs_realtime {
     include!(concat!(env!("OUT_DIR"), "/transit_realtime.rs"));
 }
 
-const VEHICLE_POSITIONS_URL: &str = "http://gtfs.bigbluebus.com/vehiclepositions.bin";
+const TRIP_UPDATES_URL: &str = "http://gtfs.bigbluebus.com/tripupdates.bin";
 
 /// GTFS-RT API client for Big Blue Bus
 pub struct GtfsClient {
@@ -26,15 +26,15 @@ impl GtfsClient {
         }
     }
 
-    /// Fetch vehicle positions from the GTFS-RT API
-    pub async fn fetch_vehicle_positions(&self) -> Result<Bytes> {
-        tracing::debug!(url = VEHICLE_POSITIONS_URL, "Fetching vehicle positions");
+    /// Fetch trip updates from the GTFS-RT API
+    pub async fn fetch_trip_updates(&self) -> Result<Bytes> {
+        tracing::debug!(url = TRIP_UPDATES_URL, "Fetching trip updates");
 
         let response = self.client
-            .get(VEHICLE_POSITIONS_URL)
+            .get(TRIP_UPDATES_URL)
             .send()
             .await
-            .context("Failed to fetch vehicle positions")?;
+            .context("Failed to fetch trip updates")?;
 
         if !response.status().is_success() {
             anyhow::bail!("API returned error status: {}", response.status());
@@ -47,8 +47,8 @@ impl GtfsClient {
         Ok(bytes)
     }
 
-    /// Parse GTFS-RT feed and extract bus observations
-    pub fn parse_feed(&self, data: &[u8]) -> Result<Vec<BusObservation>> {
+    /// Parse GTFS-RT feed and extract trip updates
+    pub fn parse_feed(&self, data: &[u8]) -> Result<Vec<TripUpdate>> {
         use gtfs_realtime::FeedMessage;
 
         let feed = FeedMessage::decode(data)
@@ -56,88 +56,96 @@ impl GtfsClient {
 
         tracing::debug!(entities = feed.entity.len(), "Decoded protobuf feed");
 
-        let mut observations = Vec::new();
+        let mut trip_updates = Vec::new();
+        let feed_timestamp = feed.header.timestamp.unwrap_or(0) as i64;
 
         for entity in feed.entity {
-            // Only process entities that have vehicle position data
-            if let Some(vehicle) = entity.vehicle {
-                // Extract trip information
-                let (route_id, trip_id, direction_id) = if let Some(trip) = vehicle.trip {
-                    (
-                        trip.route_id.clone(),
-                        trip.trip_id.clone(),
-                        trip.direction_id,
-                    )
-                } else {
-                    continue; // Skip if no trip info
-                };
+            // Only process entities that have trip update data
+            if let Some(trip_update) = entity.trip_update {
+                // Extract trip information (trip is a required field)
+                let trip_descriptor = &trip_update.trip;
 
-                // Extract vehicle ID
-                let vehicle_id = vehicle.vehicle
-                    .and_then(|v| v.id)
-                    .unwrap_or_else(|| "unknown".to_string());
+                let route_id = trip_descriptor.route_id.clone().unwrap_or_else(|| "unknown".to_string());
+                let trip_id = trip_descriptor.trip_id.clone().unwrap_or_else(|| "unknown".to_string());
+                let direction_id = trip_descriptor.direction_id.map(|d| d as i32);
 
-                // Extract position
-                if let Some(position) = vehicle.position {
-                    let latitude = position.latitude as f64;
-                    let longitude = position.longitude as f64;
+                // Extract vehicle ID if available
+                let vehicle_id = trip_update.vehicle
+                    .and_then(|v| v.id);
 
-                    // Get timestamp (prefer vehicle timestamp, fallback to feed header)
-                    let timestamp = vehicle.timestamp.unwrap_or_else(|| {
-                        feed.header.timestamp.unwrap_or(0)
-                    }) as i64;
+                // Extract stop time updates
+                let mut stop_time_updates = Vec::new();
+                for stu in trip_update.stop_time_update {
+                    let stop_sequence = stu.stop_sequence.unwrap_or(0);
+                    let stop_id = stu.stop_id;
 
-                    let mut obs = BusObservation::new(
-                        timestamp,
-                        vehicle_id,
-                        route_id.unwrap_or_else(|| "unknown".to_string()),
-                        latitude,
-                        longitude,
-                    );
+                    let arrival = stu.arrival.map(|a| StopTimeEvent {
+                        time: a.time,
+                        delay: a.delay,
+                        uncertainty: a.uncertainty,
+                    });
 
-                    // Add optional fields
-                    obs.trip_id = trip_id;
-                    obs.direction_id = direction_id.map(|d| d as i32);
-                    obs.current_stop_sequence = vehicle.current_stop_sequence.map(|s| s as i32);
-                    obs.speed = position.speed;
-                    obs.bearing = position.bearing;
+                    let departure = stu.departure.map(|d| StopTimeEvent {
+                        time: d.time,
+                        delay: d.delay,
+                        uncertainty: d.uncertainty,
+                    });
 
-                    observations.push(obs);
+                    stop_time_updates.push(StopTimeUpdate {
+                        stop_sequence,
+                        stop_id,
+                        arrival,
+                        departure,
+                    });
                 }
+
+                // Get timestamp (prefer trip update timestamp, fallback to feed header)
+                let timestamp = trip_update.timestamp.map(|t| t as i64).unwrap_or(feed_timestamp);
+
+                trip_updates.push(TripUpdate {
+                    route_id,
+                    trip_id,
+                    direction_id,
+                    vehicle_id,
+                    stop_time_updates,
+                    timestamp,
+                });
             }
         }
 
-        tracing::info!(count = observations.len(), "Parsed vehicle observations");
-        Ok(observations)
+        tracing::info!(count = trip_updates.len(), "Parsed trip updates");
+        Ok(trip_updates)
     }
 
-    /// Poll the API and return bus observations for Route 1
-    pub async fn poll_route_1(&self) -> Result<(Vec<BusObservation>, PollStats)> {
-        let data = self.fetch_vehicle_positions().await?;
-        let all_observations = self.parse_feed(&data)?;
-
-        let total_vehicles = all_observations.len();
-
-        // Filter for Route 1
-        let route_1: Vec<_> = all_observations.into_iter()
-            // .filter(|obs| obs.is_route_1())
-            .collect();
-
-        let route_1_count = route_1.len();
-
-        let stats = PollStats {
-            total_vehicles,
-            route_1_vehicles: route_1_count,
-            timestamp: chrono::Utc::now().timestamp(),
-        };
+    /// Poll the API and return all trip updates
+    pub async fn poll_trip_updates(&self) -> Result<Vec<TripUpdate>> {
+        let data = self.fetch_trip_updates().await?;
+        let trip_updates = self.parse_feed(&data)?;
 
         tracing::debug!(
-            total = total_vehicles,
-            route_1 = route_1_count,
-            "Filtered vehicles"
+            total = trip_updates.len(),
+            "Fetched trip updates"
         );
 
-        Ok((route_1, stats))
+        Ok(trip_updates)
+    }
+
+    /// Poll the API and return trip updates filtered by route IDs
+    pub async fn poll_routes(&self, route_ids: &[&str]) -> Result<Vec<TripUpdate>> {
+        let all_updates = self.poll_trip_updates().await?;
+
+        let filtered: Vec<TripUpdate> = all_updates
+            .into_iter()
+            .filter(|update| route_ids.iter().any(|&id| update.is_route(id)))
+            .collect();
+
+        tracing::info!(
+            total = filtered.len(),
+            routes = ?route_ids,
+            "Filtered trip updates"
+        );
+
+        Ok(filtered)
     }
 }
 

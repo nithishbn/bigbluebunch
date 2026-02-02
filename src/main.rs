@@ -1,10 +1,8 @@
 mod api;
-mod db;
 mod models;
 
 use anyhow::Result;
 use api::GtfsClient;
-use db::Database;
 use std::time::Duration;
 
 #[tokio::main]
@@ -17,87 +15,87 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    tracing::info!("Big Blue Bus Route 1 Bunching Tracker");
-    tracing::info!("Starting polling service...");
-
-    // Initialize database
-    let db = Database::new("bus_tracking.db").await?;
-    tracing::info!("Database initialized");
+    tracing::info!("Big Blue Bus Trip Updates Monitor");
+    tracing::info!("Monitoring Route 1 and Route 2");
+    tracing::info!("");
 
     // Initialize GTFS-RT client
     let client = GtfsClient::new();
     tracing::info!("GTFS-RT client ready");
+    tracing::info!("");
 
-    // Print initial stats
-    let total_count = db.count_observations().await?;
-    let route_1_count = db.count_route_1_observations().await?;
-    tracing::info!(
-        total_observations = total_count,
-        route_1_observations = route_1_count,
-        "Database initialized with existing data"
-    );
-
-    // Polling interval: 15 seconds
-    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    // Polling interval: 30 seconds
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
     let mut poll_count = 0;
 
-    tracing::info!("Starting polling loop (15 second interval)");
+    tracing::info!("Starting polling loop (30 second interval)");
+    tracing::info!("=====================================");
     tracing::info!("");
 
     loop {
         interval.tick().await;
         poll_count += 1;
 
-        tracing::info!(poll_number = poll_count, "Starting poll");
+        println!("\n┌─ Poll #{} ─────────────────────────────────────", poll_count);
+        println!("│ Time: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        println!("└────────────────────────────────────────────────────");
 
-        match client.poll_route_1().await {
-            Ok((observations, stats)) => {
-                tracing::info!(
-                    total_vehicles = stats.total_vehicles,
-                    route_1_vehicles = stats.route_1_vehicles,
-                    "Poll complete"
-                );
+        match client.poll_routes(&["1", "2"]).await {
+            Ok(trip_updates) => {
+                let route_1_count = trip_updates.iter().filter(|t| t.is_route("1")).count();
+                let route_2_count = trip_updates.iter().filter(|t| t.is_route("2")).count();
 
-                // Display each bus
-                for obs in &observations {
-                    tracing::info!(
-                        vehicle_id = %obs.vehicle_id,
-                        route_id = %obs.route_id,
-                        lat = obs.latitude,
-                        lon = obs.longitude,
-                        "Bus position"
-                    );
-                }
+                println!("\n📊 Summary: {} total trips ({} Route 1, {} Route 2)",
+                    trip_updates.len(), route_1_count, route_2_count);
 
-                // Save to database
-                if !observations.is_empty() {
-                    match db.insert_observations(&observations).await {
-                        Ok(count) => {
-                            tracing::info!(saved_count = count, "Saved observations to database");
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "Failed to save observations");
+                if trip_updates.is_empty() {
+                    println!("\n⚠️  No active trips found for Route 1 or Route 2");
+                } else {
+                    // Group by route for display
+                    let route_1: Vec<_> = trip_updates.iter().filter(|t| t.is_route("1")).collect();
+                    let route_2: Vec<_> = trip_updates.iter().filter(|t| t.is_route("2")).collect();
+
+                    // Display Route 1
+                    if !route_1.is_empty() {
+                        println!("\n🚌 Route 1 ({} trips):", route_1.len());
+                        println!("─────────────────────────────────────────────────");
+                        for trip in route_1 {
+                            println!("{}", trip);
+                            // Show first 3 stops with updates as example
+                            for stop in trip.stop_time_updates.iter().take(3) {
+                                println!("{}", stop);
+                            }
+                            if trip.stop_time_updates.len() > 3 {
+                                println!("  ... and {} more stops", trip.stop_time_updates.len() - 3);
+                            }
+                            println!();
                         }
                     }
-                } else {
-                    tracing::info!("No buses currently active");
-                }
 
-                // Update stats
-                let total = db.count_observations().await.unwrap_or(0);
-                let route_1 = db.count_route_1_observations().await.unwrap_or(0);
-                tracing::info!(
-                    total_observations = total,
-                    route_1_observations = route_1,
-                    "Database stats"
-                );
+                    // Display Route 2
+                    if !route_2.is_empty() {
+                        println!("\n🚌 Route 2 ({} trips):", route_2.len());
+                        println!("─────────────────────────────────────────────────");
+                        for trip in route_2 {
+                            println!("{}", trip);
+                            // Show first 3 stops with updates as example
+                            for stop in trip.stop_time_updates.iter().take(3) {
+                                println!("{}", stop);
+                            }
+                            if trip.stop_time_updates.len() > 3 {
+                                println!("  ... and {} more stops", trip.stop_time_updates.len() - 3);
+                            }
+                            println!();
+                        }
+                    }
+                }
             }
             Err(e) => {
-                tracing::error!(error = %e, "Poll failed");
-                tracing::warn!("Will retry on next interval");
+                eprintln!("\n❌ Poll failed: {}", e);
+                eprintln!("⏳ Will retry on next interval");
             }
         }
 
-        tracing::info!("");
+        println!("\n════════════════════════════════════════════════════\n");
     }
 }
