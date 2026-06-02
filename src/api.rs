@@ -152,6 +152,18 @@ impl TransitClient {
                         lon: s.stop_lon,
                     });
                 }
+
+                // Get timestamp (prefer trip update timestamp, fallback to feed header)
+                let timestamp = trip_update.timestamp.map(|t| t as i64).unwrap_or(feed_timestamp);
+
+                trip_updates.push(TripUpdate {
+                    route_id,
+                    trip_id,
+                    direction_id,
+                    vehicle_id,
+                    stop_time_updates,
+                    timestamp,
+                });
             }
         }
 
