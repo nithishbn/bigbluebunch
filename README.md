@@ -189,32 +189,87 @@ sqlite3 bus_tracking.db
 -- How many departures logged total?
 SELECT COUNT(*) FROM departure_log;
 
--- Departures per poll session
-SELECT datetime(polled_at, 'unixepoch') as time, COUNT(*) as deps
+-- Departures per poll session (confirms polling is running)
+SELECT datetime(polled_at, 'unixepoch', 'localtime') as time, COUNT(*) as deps
 FROM departure_log GROUP BY polled_at ORDER BY polled_at DESC LIMIT 20;
 
--- Average delay for Route 1 at a specific stop
-SELECT
-    route_short_name,
-    AVG(delay_seconds) / 60.0 as avg_delay_min,
-    COUNT(*) as samples
+-- Routes captured and their departure counts
+SELECT route_short_name, COUNT(*) as dep_count
 FROM departure_log
-WHERE global_stop_id = 'BBB:7023'
-  AND route_short_name = '1'
-  AND is_real_time = 1
-GROUP BY route_short_name;
+GROUP BY route_short_name
+ORDER BY dep_count DESC;
 
--- Service gaps: time between consecutive Route 1 departures at a stop
-WITH t AS (
-    SELECT departure_time,
-           LAG(departure_time) OVER (ORDER BY departure_time) as prev
+-- Find stop IDs for a street name
+SELECT global_stop_id, stop_name FROM stops WHERE stop_name LIKE '%Barrington%';
+```
+
+#### Headway analysis (scheduled vs actual gaps)
+
+Deduplicates across poll sessions so each real departure is counted once.
+Replace `global_stop_id` and `route_short_name` with your stop of interest.
+
+```sql
+WITH deduped AS (
+    SELECT DISTINCT scheduled_departure_time, departure_time
     FROM departure_log
-    WHERE global_stop_id = 'BBB:7023' AND route_short_name = '1'
+    WHERE global_stop_id = 'BBB:6863'
+      AND route_short_name = '1'
+      AND is_real_time = 1
+),
+t AS (
+    SELECT
+        scheduled_departure_time,
+        departure_time,
+        LAG(scheduled_departure_time) OVER (ORDER BY scheduled_departure_time) as prev_sched,
+        LAG(departure_time)           OVER (ORDER BY scheduled_departure_time) as prev_actual
+    FROM deduped
 )
 SELECT
-    datetime(departure_time, 'unixepoch') as at,
-    (departure_time - prev) / 60.0 as gap_min
-FROM t WHERE prev IS NOT NULL ORDER BY gap_min DESC LIMIT 20;
+    datetime(scheduled_departure_time, 'unixepoch', 'localtime') as sched_at,
+    ROUND((scheduled_departure_time - prev_sched) / 60.0, 0)     as sched_gap_min,
+    ROUND((departure_time - prev_actual) / 60.0, 0)              as actual_gap_min,
+    ROUND((departure_time - scheduled_departure_time) / 60.0, 1) as delay_min
+FROM t
+WHERE prev_sched IS NOT NULL
+  AND (scheduled_departure_time - prev_sched) > 60  -- filter out sub-minute dupes
+ORDER BY scheduled_departure_time;
+```
+
+Bunching shows as `actual_gap_min` much smaller than `sched_gap_min` on consecutive rows
+(one bus early, the next close behind). A large `actual_gap_min` is a service gap.
+
+#### Worst service gaps at a stop
+
+```sql
+WITH deduped AS (
+    SELECT DISTINCT scheduled_departure_time, departure_time
+    FROM departure_log
+    WHERE global_stop_id = 'BBB:6863' AND route_short_name = '1'
+),
+t AS (
+    SELECT departure_time,
+           LAG(departure_time) OVER (ORDER BY departure_time) as prev
+    FROM deduped
+)
+SELECT
+    datetime(departure_time, 'unixepoch', 'localtime') as at,
+    ROUND((departure_time - prev) / 60.0, 1)           as gap_min
+FROM t
+WHERE prev IS NOT NULL
+ORDER BY gap_min DESC LIMIT 20;
+```
+
+#### Average delay by hour of day (advocacy: peak hours worst?)
+
+```sql
+SELECT
+    strftime('%H', scheduled_departure_time, 'unixepoch', 'localtime') as hour,
+    ROUND(AVG(departure_time - scheduled_departure_time) / 60.0, 1)    as avg_delay_min,
+    COUNT(*) as samples
+FROM departure_log
+WHERE route_short_name = '1' AND is_real_time = 1
+GROUP BY hour
+ORDER BY hour;
 ```
 
 ## Project Structure
