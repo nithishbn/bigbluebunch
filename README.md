@@ -126,6 +126,16 @@ curl "http://localhost:8080/api/departures?stop_ids=BBB:7023,MLA:107070"
 }
 ```
 
+### `GET /api/stops`
+
+Returns all stops with coordinates. Loaded from DB at startup, served from memory.
+
+```json
+[
+  { "global_stop_id": "BBB:7023", "stop_name": "Barrington & Santa Monica", "lat": 34.0321, "lon": -118.4812 }
+]
+```
+
 ### `GET /api/status`
 
 ```json
@@ -133,6 +143,7 @@ curl "http://localhost:8080/api/departures?stop_ids=BBB:7023,MLA:107070"
   "status": "ok",
   "last_polled_at": 1748123456,
   "departure_count": 2700,
+  "stop_count": 126,
   "timestamp": 1748123500
 }
 ```
@@ -214,11 +225,13 @@ bigbluebunch/
 ├── flake.nix                  # Nix dev shell (rustc, sqlx-cli, jq, protobuf)
 ├── .env                       # API key + route/stop config (not committed)
 ├── bus_tracking.db            # SQLite database (created at runtime)
+├── static/
+│   └── map.html               # Leaflet departure map (embedded at compile time)
 ├── src/
 │   ├── lib.rs                 # Module exports
 │   ├── main.rs                # CLI binary (--discover, --resolve-stops)
 │   ├── api.rs                 # Transit App API client
-│   ├── api_server.rs          # Axum server (/api/departures, /api/status)
+│   ├── api_server.rs          # Axum server (/, /api/departures, /api/stops, /api/status)
 │   ├── db.rs                  # SQLite layer (stops + departure_log)
 │   ├── models.rs              # Stop, Departure, PollResult structs
 │   └── bin/

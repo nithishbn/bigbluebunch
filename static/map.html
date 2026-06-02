@@ -16,10 +16,23 @@
     pointer-events: none;
   }
   #status-bar.stale { background: rgba(160,30,30,0.88); }
-  .dep-popup { font-size: 13px; line-height: 1.6; min-width: 180px; }
+  .dep-popup { font-size: 13px; line-height: 1.6; min-width: 200px; }
   .dep-popup h3 { margin: 0 0 6px; font-size: 14px; }
-  .dep-row { display: flex; justify-content: space-between; gap: 12px; }
-  .dep-row .route { font-weight: bold; color: #1565C0; min-width: 28px; }
+  .dep-popup details { margin-bottom: 4px; }
+  .dep-popup summary {
+    cursor: pointer; font-weight: bold; color: #1565C0;
+    list-style: none; display: flex; align-items: center; gap: 6px;
+    padding: 2px 0; user-select: none;
+  }
+  .dep-popup summary::-webkit-details-marker { display: none; }
+  .dep-popup summary::before { content: '▶'; font-size: 9px; color: #999; transition: transform 0.15s; }
+  .dep-popup details[open] summary::before { transform: rotate(90deg); }
+  .dep-popup summary .route-badge {
+    background: #1565C0; color: #fff; border-radius: 4px;
+    padding: 1px 6px; font-size: 12px;
+  }
+  .dep-popup summary .route-head { font-weight: normal; color: #555; font-size: 12px; }
+  .dep-row { display: flex; justify-content: space-between; gap: 12px; padding-left: 16px; }
   .dep-row .time { color: #222; }
   .dep-row .rt { color: #2e7d32; font-size: 11px; }
   .dep-row .late { color: #b71c1c; }
@@ -63,25 +76,45 @@ function buildPopup(stopId) {
   const s = stopMap[stopId];
   const deps = lastDeps[stopId] || [];
   const now = Date.now() / 1000;
-  const upcoming = deps.filter(d => d.departure_time > now - 30).slice(0, 5);
+  const upcoming = deps.filter(d => d.departure_time > now - 30);
 
   let html = `<div class="dep-popup"><h3>${s.stop_name}</h3>`;
   if (upcoming.length === 0) {
     html += '<div class="no-deps">No upcoming departures</div>';
   } else {
+    // Group by route, preserving first-seen order
+    const routeOrder = [];
+    const byRoute = {};
     for (const d of upcoming) {
-      const delayMin = d.delay_seconds != null ? Math.round(d.delay_seconds / 60) : null;
-      const delayCls = d.is_cancelled ? 'cancelled' : (delayMin != null && delayMin > 2 ? 'late' : '');
-      const delayStr = d.is_cancelled ? ' cancelled'
-        : (d.is_real_time && delayMin != null && delayMin !== 0
-            ? ` ${delayMin > 0 ? '+' : ''}${delayMin}m` : '');
-      const rtBadge = d.is_real_time && !d.is_cancelled ? '<span class="rt"> ●</span>' : '';
-      const title = d.headsign ? ` title="→ ${d.headsign}"` : '';
-      html += `<div class="dep-row">
-        <span class="route"${title}>${d.route_short_name}</span>
-        <span class="time ${delayCls}">${minsFrom(d.departure_time)} (${fmt(d.departure_time)}${delayStr})${rtBadge}</span>
-      </div>`;
+      const key = d.global_route_id;
+      if (!byRoute[key]) { byRoute[key] = []; routeOrder.push(key); }
+      byRoute[key].push(d);
     }
+
+    routeOrder.forEach((routeId, idx) => {
+      const deps = byRoute[routeId];
+      const first = deps[0];
+      const headsign = first.headsign ? `<span class="route-head"> → ${first.headsign}</span>` : '';
+      const openAttr = idx === 0 ? ' open' : '';
+
+      html += `<details${openAttr}><summary>
+        <span class="route-badge">${first.route_short_name}</span>${headsign}
+      </summary>`;
+
+      for (const d of deps.slice(0, 4)) {
+        const delayMin = d.delay_seconds != null ? Math.round(d.delay_seconds / 60) : null;
+        const delayCls = d.is_cancelled ? 'cancelled' : (delayMin != null && delayMin > 2 ? 'late' : '');
+        const delayStr = d.is_cancelled ? ' cancelled'
+          : (d.is_real_time && delayMin != null && delayMin !== 0
+              ? ` ${delayMin > 0 ? '+' : ''}${delayMin}m` : '');
+        const rtBadge = d.is_real_time && !d.is_cancelled ? '<span class="rt"> ●</span>' : '';
+        html += `<div class="dep-row">
+          <span class="time ${delayCls}">${minsFrom(d.departure_time)} (${fmt(d.departure_time)}${delayStr})${rtBadge}</span>
+        </div>`;
+      }
+
+      html += `</details>`;
+    });
   }
   html += `<div style="font-size:10px;color:#aaa;margin-top:6px">${stopId}</div></div>`;
   return html;
