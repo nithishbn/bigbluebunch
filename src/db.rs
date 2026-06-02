@@ -1,19 +1,17 @@
 use anyhow::{Context, Result};
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{postgres::PgPoolOptions, Row, PgPool};
 
 use crate::models::{Departure, Stop};
 
 pub struct Database {
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
 impl Database {
-    pub async fn new(path: &str) -> Result<Self> {
-        let database_url = format!("sqlite://{}?mode=rwc", path);
-
-        let pool = SqlitePoolOptions::new()
+    pub async fn new(database_url: &str) -> Result<Self> {
+        let pool = PgPoolOptions::new()
             .max_connections(5)
-            .connect(&database_url)
+            .connect(database_url)
             .await
             .context("Failed to connect to database")?;
 
@@ -27,8 +25,8 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS stops (
                 global_stop_id TEXT PRIMARY KEY,
                 stop_name TEXT NOT NULL,
-                lat REAL NOT NULL,
-                lon REAL NOT NULL
+                lat DOUBLE PRECISION NOT NULL,
+                lon DOUBLE PRECISION NOT NULL
             )",
         )
         .execute(&self.pool)
@@ -37,17 +35,17 @@ impl Database {
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS departure_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                polled_at INTEGER NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
+                polled_at BIGINT NOT NULL,
                 global_stop_id TEXT NOT NULL,
                 global_route_id TEXT NOT NULL,
                 route_short_name TEXT NOT NULL,
                 headsign TEXT,
-                departure_time INTEGER NOT NULL,
-                scheduled_departure_time INTEGER NOT NULL,
+                departure_time BIGINT NOT NULL,
+                scheduled_departure_time BIGINT NOT NULL,
                 delay_seconds INTEGER,
-                is_real_time INTEGER NOT NULL DEFAULT 0,
-                is_cancelled INTEGER NOT NULL DEFAULT 0,
+                is_real_time BOOLEAN NOT NULL DEFAULT FALSE,
+                is_cancelled BOOLEAN NOT NULL DEFAULT FALSE,
                 rt_trip_id TEXT
             )",
         )
@@ -56,16 +54,14 @@ impl Database {
         .context("Failed to create departure_log table")?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_log_polled_at \
-             ON departure_log(polled_at)",
+            "CREATE INDEX IF NOT EXISTS idx_log_polled_at ON departure_log(polled_at)",
         )
         .execute(&self.pool)
         .await
         .context("Failed to create polled_at index")?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_log_stop \
-             ON departure_log(global_stop_id, departure_time)",
+            "CREATE INDEX IF NOT EXISTS idx_log_stop ON departure_log(global_stop_id, departure_time)",
         )
         .execute(&self.pool)
         .await
@@ -89,11 +85,11 @@ impl Database {
         for stop in stops {
             sqlx::query(
                 "INSERT INTO stops (global_stop_id, stop_name, lat, lon)
-                 VALUES (?, ?, ?, ?)
+                 VALUES ($1, $2, $3, $4)
                  ON CONFLICT(global_stop_id) DO UPDATE SET
-                   stop_name = excluded.stop_name,
-                   lat = excluded.lat,
-                   lon = excluded.lon",
+                   stop_name = EXCLUDED.stop_name,
+                   lat = EXCLUDED.lat,
+                   lon = EXCLUDED.lon",
             )
             .bind(&stop.global_stop_id)
             .bind(&stop.stop_name)
@@ -151,7 +147,7 @@ impl Database {
                     polled_at, global_stop_id, global_route_id, route_short_name, headsign,
                     departure_time, scheduled_departure_time, delay_seconds,
                     is_real_time, is_cancelled, rt_trip_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(polled_at)
             .bind(&dep.global_stop_id)
@@ -172,5 +168,4 @@ impl Database {
         tx.commit().await.context("Failed to commit departure log")?;
         Ok(departures.len())
     }
-
 }

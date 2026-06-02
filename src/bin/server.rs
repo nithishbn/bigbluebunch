@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bigbluebunch::{api::TransitClient, api_server, db::Database, models::PollResult};
 use chrono::{Datelike, Local, Timelike, Weekday};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Big Blue Bus Tracker starting");
 
+    // Routes for full stop bootstrap — all stops on these routes go into the stops table
     let route_ids: Vec<String> = std::env::var("ROUTE_IDS")
         .unwrap_or_default()
         .split(',')
@@ -48,25 +50,34 @@ async fn main() -> Result<()> {
         );
     }
 
-    let extra_stop_ids: Vec<String> = std::env::var("EXTRA_STOP_IDS")
+    // Routes used only to resolve stop metadata for EXTRA_STOP_IDS.
+    // All stops on these routes are fetched but only those matching EXTRA_STOP_IDS are kept.
+    let extra_route_ids: Vec<String> = std::env::var("EXTRA_ROUTE_IDS")
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    if !extra_stop_ids.is_empty() {
-        tracing::info!(count = extra_stop_ids.len(), "Extra stop IDs loaded from EXTRA_STOP_IDS");
-    }
+    // Specific stop IDs to watch — must overlap with stops seeded by ROUTE_IDS or EXTRA_ROUTE_IDS
+    let extra_stop_ids: HashSet<String> = std::env::var("EXTRA_STOP_IDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
+    let database_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL must be set in .env")?;
+
     let client = Arc::new(TransitClient::from_env());
-    let db = Arc::new(Database::new("bus_tracking.db").await?);
+    let db = Arc::new(Database::new(&database_url).await?);
     let cache: api_server::Cache = Arc::new(RwLock::new(None));
 
-    // Bootstrap stops from route_details if table is empty (1 API call per route, once ever)
+    // ── Full route bootstrap (runs once, when stops table is empty) ──────────
     if !db.stops_initialized().await? {
         tracing::info!(routes = route_ids.len(), "Bootstrapping stops from route_details");
         for (i, route_id) in route_ids.iter().enumerate() {
@@ -86,17 +97,42 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_secs(13)).await;
     }
 
-    // Build stop ID list for polling (DB stops + EXTRA_STOP_IDS, deduplicated)
-    let mut stop_ids = db.get_all_stop_ids().await?;
-    let existing: std::collections::HashSet<_> = stop_ids.iter().cloned().collect();
-    for id in &extra_stop_ids {
-        if !existing.contains(id) {
-            stop_ids.push(id.clone());
+    // ── Extra route bootstrap (metadata only, filtered to EXTRA_STOP_IDS) ───
+    // Runs whenever any EXTRA_STOP_IDS are missing from the stops table.
+    if !extra_route_ids.is_empty() && !extra_stop_ids.is_empty() {
+        let in_db: HashSet<String> = db.get_all_stop_ids().await?.into_iter().collect();
+        let missing: HashSet<&String> = extra_stop_ids.iter().filter(|id| !in_db.contains(*id)).collect();
+
+        if !missing.is_empty() {
+            tracing::info!(count = missing.len(), "Bootstrapping extra stop metadata from EXTRA_ROUTE_IDS");
+            for (i, route_id) in extra_route_ids.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_secs(13)).await;
+                }
+                match client.fetch_route_stops(route_id).await {
+                    Ok(stops) => {
+                        let filtered: Vec<_> = stops.into_iter()
+                            .filter(|s| missing.contains(&s.global_stop_id))
+                            .collect();
+                        tracing::info!(route = %route_id, count = filtered.len(), "Upserted extra stops");
+                        if !filtered.is_empty() {
+                            db.upsert_stops(&filtered).await?;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(route = %route_id, error = %e, "Failed to fetch extra route stops");
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(13)).await;
         }
     }
 
+    // Poll list is simply everything in the stops table — both full-route stops and extra stops
+    let stop_ids = db.get_all_stop_ids().await?;
+
     if stop_ids.is_empty() {
-        anyhow::bail!("No stops configured — check ROUTE_IDS and EXTRA_STOP_IDS");
+        anyhow::bail!("No stops configured — check ROUTE_IDS and EXTRA_ROUTE_IDS");
     }
 
     // Load full stop metadata (with coordinates) for the map

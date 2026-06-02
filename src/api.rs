@@ -228,7 +228,7 @@ impl TransitClient {
             .query(&[
                 ("lat", DISCOVERY_LAT.to_string()),
                 ("lon", DISCOVERY_LON.to_string()),
-                ("max_distance", "150".to_string()),
+                ("max_distance", "300".to_string()),
                 ("should_update_realtime", "false".to_string()),
                 ("max_num_departures", "0".to_string()),
             ])

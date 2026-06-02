@@ -24,6 +24,7 @@
             protobuf
             rust-analyzer
             jq
+            postgresql
           ];
 
           shellHook = ''
