@@ -1,148 +1,287 @@
+use crate::models::{Departure, Stop};
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use prost::Message;
-use crate::models::{BusObservation, PollStats};
+use serde::Deserialize;
 
-// Include the generated protobuf code
-pub mod gtfs_realtime {
-    include!(concat!(env!("OUT_DIR"), "/transit_realtime.rs"));
-}
+const TRANSIT_API_BASE: &str = "https://external.transitapp.com";
+const DISCOVERY_LAT: f64 = 34.04363632;
+const DISCOVERY_LON: f64 = -118.45709929;
 
-const VEHICLE_POSITIONS_URL: &str = "http://gtfs.bigbluebus.com/vehiclepositions.bin";
-
-/// GTFS-RT API client for Big Blue Bus
-pub struct GtfsClient {
+pub struct TransitClient {
     client: reqwest::Client,
+    api_key: String,
 }
 
-impl GtfsClient {
-    /// Create a new GTFS-RT client
-    pub fn new() -> Self {
+// --- route_details response ---
+
+#[derive(Deserialize)]
+struct RouteDetailsResponse {
+    itineraries: Vec<ItineraryDetail>,
+}
+
+#[derive(Deserialize)]
+struct ItineraryDetail {
+    #[serde(default)]
+    stops: Vec<RouteStop>,
+}
+
+#[derive(Deserialize)]
+struct RouteStop {
+    global_stop_id: String,
+    stop_name: String,
+    stop_lat: f64,
+    stop_lon: f64,
+}
+
+// --- stop_departures response ---
+
+#[derive(Deserialize)]
+struct StopDeparturesResponse {
+    route_departures: Vec<StopRouteDeparture>,
+}
+
+#[derive(Deserialize)]
+struct StopRouteDeparture {
+    global_route_id: String,
+    route_short_name: String,
+    global_stop_id: String,
+    #[serde(default)]
+    merged_itineraries: Vec<MergedItinerary>,
+}
+
+#[derive(Deserialize)]
+struct MergedItinerary {
+    #[serde(default)]
+    itineraries: Vec<RouteItinerary>,
+    #[serde(default)]
+    schedule_items: Vec<ScheduleItem>,
+}
+
+#[derive(Deserialize)]
+struct RouteItinerary {
+    headsign: Option<String>,
+    merged_headsign: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleItem {
+    departure_time: i64,
+    scheduled_departure_time: Option<i64>,
+    #[serde(default)]
+    is_real_time: bool,
+    #[serde(default)]
+    is_cancelled: bool,
+    rt_trip_id: Option<String>,
+}
+
+// --- nearby_stops response (resolve-stops discovery) ---
+
+#[derive(Deserialize)]
+pub struct NearbyStopsResponse {
+    pub stops: Vec<NearbyStop>,
+}
+
+#[derive(Deserialize)]
+pub struct NearbyStop {
+    pub global_stop_id: String,
+    pub stop_name: String,
+    pub stop_code: Option<String>,
+    pub distance: Option<f64>,
+}
+
+// --- nearby_routes response (route discovery) ---
+
+#[derive(Deserialize)]
+struct DiscoverRoutesResponse {
+    nearby_routes: Vec<DiscoverRoute>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverRoute {
+    global_route_id: String,
+    route_short_name: String,
+    route_network_name: Option<String>,
+}
+
+impl TransitClient {
+    pub fn new(api_key: String) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),
+            api_key,
         }
     }
 
-    /// Fetch vehicle positions from the GTFS-RT API
-    pub async fn fetch_vehicle_positions(&self) -> Result<Bytes> {
-        tracing::debug!(url = VEHICLE_POSITIONS_URL, "Fetching vehicle positions");
+    pub fn from_env() -> Self {
+        let api_key = std::env::var("TRANSIT_API_KEY").expect("TRANSIT_API_KEY must be set");
+        Self::new(api_key)
+    }
 
-        let response = self.client
-            .get(VEHICLE_POSITIONS_URL)
+    /// Bootstrap: fetch all stops for a route from route_details.
+    /// Deduplicates across itineraries/directions.
+    pub async fn fetch_route_stops(&self, global_route_id: &str) -> Result<Vec<Stop>> {
+        let response = self
+            .client
+            .get(format!("{}/v4/public/route_details", TRANSIT_API_BASE))
+            .header("apiKey", &self.api_key)
+            .query(&[("global_route_id", global_route_id)])
             .send()
             .await
-            .context("Failed to fetch vehicle positions")?;
+            .context("Failed to call route_details")?;
 
         if !response.status().is_success() {
-            anyhow::bail!("API returned error status: {}", response.status());
+            anyhow::bail!("route_details returned {}", response.status());
         }
 
-        let bytes = response.bytes().await
-            .context("Failed to read response body")?;
+        let body: RouteDetailsResponse = response
+            .json()
+            .await
+            .context("Failed to parse route_details response")?;
 
-        tracing::debug!(bytes = bytes.len(), "Received data from API");
-        Ok(bytes)
-    }
+        let mut seen = std::collections::HashSet::new();
+        let mut stops = Vec::new();
 
-    /// Parse GTFS-RT feed and extract bus observations
-    pub fn parse_feed(&self, data: &[u8]) -> Result<Vec<BusObservation>> {
-        use gtfs_realtime::FeedMessage;
-
-        let feed = FeedMessage::decode(data)
-            .context("Failed to decode protobuf message")?;
-
-        tracing::debug!(entities = feed.entity.len(), "Decoded protobuf feed");
-
-        let mut observations = Vec::new();
-
-        for entity in feed.entity {
-            // Only process entities that have vehicle position data
-            if let Some(vehicle) = entity.vehicle {
-                // Extract trip information
-                let (route_id, trip_id, direction_id) = if let Some(trip) = vehicle.trip {
-                    (
-                        trip.route_id.clone(),
-                        trip.trip_id.clone(),
-                        trip.direction_id,
-                    )
-                } else {
-                    continue; // Skip if no trip info
-                };
-
-                // Extract vehicle ID
-                let vehicle_id = vehicle.vehicle
-                    .and_then(|v| v.id)
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                // Extract position
-                if let Some(position) = vehicle.position {
-                    let latitude = position.latitude as f64;
-                    let longitude = position.longitude as f64;
-
-                    // Get timestamp (prefer vehicle timestamp, fallback to feed header)
-                    let timestamp = vehicle.timestamp.unwrap_or_else(|| {
-                        feed.header.timestamp.unwrap_or(0)
-                    }) as i64;
-
-                    let mut obs = BusObservation::new(
-                        timestamp,
-                        vehicle_id,
-                        route_id.unwrap_or_else(|| "unknown".to_string()),
-                        latitude,
-                        longitude,
-                    );
-
-                    // Add optional fields
-                    obs.trip_id = trip_id;
-                    obs.direction_id = direction_id.map(|d| d as i32);
-                    obs.current_stop_sequence = vehicle.current_stop_sequence.map(|s| s as i32);
-                    obs.speed = position.speed;
-                    obs.bearing = position.bearing;
-
-                    observations.push(obs);
+        for itinerary in body.itineraries {
+            for s in itinerary.stops {
+                if seen.insert(s.global_stop_id.clone()) {
+                    stops.push(Stop {
+                        global_stop_id: s.global_stop_id,
+                        stop_name: s.stop_name,
+                        lat: s.stop_lat,
+                        lon: s.stop_lon,
+                    });
                 }
             }
         }
 
-        tracing::info!(count = observations.len(), "Parsed vehicle observations");
-        Ok(observations)
+        Ok(stops)
     }
 
-    /// Poll the API and return bus observations for Route 1
-    pub async fn poll_route_1(&self) -> Result<(Vec<BusObservation>, PollStats)> {
-        let data = self.fetch_vehicle_positions().await?;
-        let all_observations = self.parse_feed(&data)?;
+    /// Poll: fetch upcoming real-time departures for a batch of stop IDs (max 100 per call).
+    pub async fn fetch_stop_departures(&self, stop_ids: &[String]) -> Result<Vec<Departure>> {
+        let stop_ids_param = stop_ids.join(",");
 
-        let total_vehicles = all_observations.len();
+        let response = self
+            .client
+            .get(format!("{}/v4/public/stop_departures", TRANSIT_API_BASE))
+            .header("apiKey", &self.api_key)
+            .query(&[
+                ("global_stop_ids", stop_ids_param.as_str()),
+                ("should_update_realtime", "true"),
+                ("max_num_departures", "10"),
+            ])
+            .send()
+            .await
+            .context("Failed to call stop_departures")?;
 
-        // Filter for Route 1
-        let route_1: Vec<_> = all_observations.into_iter()
-            // .filter(|obs| obs.is_route_1())
-            .collect();
+        if !response.status().is_success() {
+            anyhow::bail!("stop_departures returned {}", response.status());
+        }
 
-        let route_1_count = route_1.len();
+        let body: StopDeparturesResponse = response
+            .json()
+            .await
+            .context("Failed to parse stop_departures response")?;
 
-        let stats = PollStats {
-            total_vehicles,
-            route_1_vehicles: route_1_count,
-            timestamp: chrono::Utc::now().timestamp(),
-        };
+        let mut departures = Vec::new();
 
-        tracing::debug!(
-            total = total_vehicles,
-            route_1 = route_1_count,
-            "Filtered vehicles"
-        );
+        for route_dep in body.route_departures {
+            for merged in route_dep.merged_itineraries {
+                let headsign = merged
+                    .itineraries
+                    .first()
+                    .and_then(|i| i.merged_headsign.clone().or_else(|| i.headsign.clone()));
 
-        Ok((route_1, stats))
+                for item in merged.schedule_items {
+                    let scheduled = item.scheduled_departure_time.unwrap_or(item.departure_time);
+                    let delay_seconds = item
+                        .is_real_time
+                        .then(|| (item.departure_time - scheduled) as i32);
+
+                    departures.push(Departure {
+                        global_stop_id: route_dep.global_stop_id.clone(),
+                        global_route_id: route_dep.global_route_id.clone(),
+                        route_short_name: route_dep.route_short_name.clone(),
+                        headsign: headsign.clone(),
+                        departure_time: item.departure_time,
+                        scheduled_departure_time: scheduled,
+                        delay_seconds,
+                        is_real_time: item.is_real_time,
+                        is_cancelled: item.is_cancelled,
+                        rt_trip_id: item.rt_trip_id,
+                    });
+                }
+            }
+        }
+
+        departures.sort_by_key(|d| d.departure_time);
+        Ok(departures)
     }
-}
 
-impl Default for GtfsClient {
-    fn default() -> Self {
-        Self::new()
+    /// One-time: log all route IDs near UCLA to find BBB global_route_ids.
+    pub async fn discover_route_id(&self) -> Result<()> {
+        let response = self
+            .client
+            .get(format!("{}/v4/public/nearby_routes", TRANSIT_API_BASE))
+            .header("apiKey", &self.api_key)
+            .query(&[
+                ("lat", DISCOVERY_LAT.to_string()),
+                ("lon", DISCOVERY_LON.to_string()),
+                ("max_distance", "150".to_string()),
+                ("should_update_realtime", "false".to_string()),
+                ("max_num_departures", "0".to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to call nearby_routes")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Transit API returned {}", response.status());
+        }
+
+        let body: DiscoverRoutesResponse = response
+            .json()
+            .await
+            .context("Failed to parse nearby_routes response")?;
+
+        tracing::info!("=== Route Discovery Results ===");
+        for route in &body.nearby_routes {
+            tracing::info!(
+                global_route_id = %route.global_route_id,
+                short_name = %route.route_short_name,
+                network = %route.route_network_name.as_deref().unwrap_or("?"),
+                "Found route"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// One-time: find stop IDs near a coordinate for populating ROUTE_IDS.
+    pub async fn resolve_stops(&self, lat: f64, lon: f64) -> Result<Vec<NearbyStop>> {
+        let response = self
+            .client
+            .get(format!("{}/v4/public/nearby_stops", TRANSIT_API_BASE))
+            .header("apiKey", &self.api_key)
+            .query(&[
+                ("lat", lat.to_string()),
+                ("lon", lon.to_string()),
+                ("max_distance", "200".to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to call nearby_stops")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("nearby_stops returned {}", response.status());
+        }
+
+        let body: NearbyStopsResponse = response
+            .json()
+            .await
+            .context("Failed to parse nearby_stops response")?;
+
+        Ok(body.stops)
     }
 }

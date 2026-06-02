@@ -23,6 +23,7 @@
             sqlite
             protobuf
             rust-analyzer
+            jq
           ];
 
           shellHook = ''

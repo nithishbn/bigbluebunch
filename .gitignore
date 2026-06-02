@@ -1,4 +1,6 @@
 /target
+.env
 .direnv
 .envrc
 bus_tracking.db
+api-1.json
