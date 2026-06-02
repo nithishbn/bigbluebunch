@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bigbluebunch::{api::TransitClient, api_server, db::Database, models::PollResult};
+use bigbluebunch::{api::TransitClient, api_server, db::Database, poll_once};
 use chrono::{Datelike, Local, Timelike, Weekday};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -145,15 +145,19 @@ async fn main() -> Result<()> {
         "Ready — polling active weekdays 7–10am and 4–7pm"
     );
 
+    let chunks_per_poll = stop_ids.chunks(100).count();
+
     // ── Departures poll task ─────────────────────────────────────────────────
     {
         let client_poll = Arc::clone(&client);
         let db_poll = Arc::clone(&db);
         let cache_poll = Arc::clone(&cache);
-        let stop_ids = stop_ids.clone();
+        let stop_ids_poll = stop_ids.clone();
 
         tokio::spawn(async move {
-            do_poll(&client_poll, &db_poll, &cache_poll, &stop_ids).await;
+            if let Some(result) = poll_once(&client_poll, &db_poll, &stop_ids_poll, true).await {
+                *cache_poll.write().await = Some(result);
+            }
 
             let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -162,47 +166,13 @@ async fn main() -> Result<()> {
                 if !is_active_window() {
                     continue;
                 }
-                do_poll(&client_poll, &db_poll, &cache_poll, &stop_ids).await;
+                if let Some(result) = poll_once(&client_poll, &db_poll, &stop_ids_poll, true).await {
+                    *cache_poll.write().await = Some(result);
+                }
             }
         });
     }
 
-    api_server::run_server(&addr, cache, stops).await?;
+    api_server::run_server(&addr, cache, stops, client, db, Arc::new(stop_ids), chunks_per_poll).await?;
     Ok(())
-}
-
-async fn do_poll(
-    client: &TransitClient,
-    db: &Database,
-    cache: &api_server::Cache,
-    stop_ids: &[String],
-) {
-    let polled_at = chrono::Utc::now().timestamp();
-    let mut all_departures = Vec::new();
-
-    for (i, chunk) in stop_ids.chunks(100).enumerate() {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_secs(13)).await;
-        }
-        match client.fetch_stop_departures(chunk).await {
-            Ok(deps) => all_departures.extend(deps),
-            Err(e) => {
-                tracing::error!(error = %e, "Departures poll failed");
-                return;
-            }
-        }
-    }
-
-    let count = all_departures.len();
-
-    if let Err(e) = db.insert_departure_log(polled_at, &all_departures).await {
-        tracing::error!(error = %e, "Failed to persist departures");
-    }
-
-    *cache.write().await = Some(PollResult {
-        polled_at,
-        departures: all_departures,
-    });
-
-    tracing::info!(departures = count, "Poll complete");
 }

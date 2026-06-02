@@ -3,7 +3,7 @@ use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::collections::HashSet;
@@ -11,7 +11,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::models::{PollResult, Stop};
+use crate::{
+    api::TransitClient,
+    db::Database,
+    models::{PollResult, Stop},
+    poll_once,
+};
 
 pub type Cache = Arc<RwLock<Option<PollResult>>>;
 
@@ -19,6 +24,10 @@ pub type Cache = Arc<RwLock<Option<PollResult>>>;
 struct AppState {
     cache: Cache,
     stops: Arc<Vec<Stop>>,
+    client: Arc<TransitClient>,
+    db: Arc<Database>,
+    stop_ids: Arc<Vec<String>>,
+    chunks_per_poll: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -69,6 +78,36 @@ async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// GET /api/quota — API call counts derived from departure_log
+async fn get_quota(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let (total_polls, today_polls) = state
+        .db
+        .count_polls()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let c = state.chunks_per_poll as i64;
+    Ok(Json(serde_json::json!({
+        "total_polls": total_polls,
+        "today_polls": today_polls,
+        "chunks_per_poll": c,
+        "total_api_calls": total_polls * c,
+        "today_api_calls": today_polls * c,
+    })))
+}
+
+/// POST /api/refresh — force an immediate poll regardless of time window
+async fn post_refresh(
+    State(state): State<AppState>,
+) -> Result<Json<PollResult>, StatusCode> {
+    match poll_once(&state.client, &state.db, &state.stop_ids, false).await {
+        Some(result) => {
+            *state.cache.write().await = Some(result.clone());
+            Ok(Json(result))
+        }
+        None => Err(StatusCode::BAD_GATEWAY),
+    }
+}
+
 /// GET / — departure map
 async fn get_map() -> impl IntoResponse {
     (
@@ -77,8 +116,16 @@ async fn get_map() -> impl IntoResponse {
     )
 }
 
-pub async fn run_server(addr: &str, cache: Cache, stops: Arc<Vec<Stop>>) -> Result<()> {
-    let state = AppState { cache, stops };
+pub async fn run_server(
+    addr: &str,
+    cache: Cache,
+    stops: Arc<Vec<Stop>>,
+    client: Arc<TransitClient>,
+    db: Arc<Database>,
+    stop_ids: Arc<Vec<String>>,
+    chunks_per_poll: usize,
+) -> Result<()> {
+    let state = AppState { cache, stops, client, db, stop_ids, chunks_per_poll };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -90,12 +137,14 @@ pub async fn run_server(addr: &str, cache: Cache, stops: Arc<Vec<Stop>>) -> Resu
         .route("/api/departures", get(get_departures))
         .route("/api/stops", get(get_stops))
         .route("/api/status", get(get_status))
+        .route("/api/quota", get(get_quota))
+        .route("/api/refresh", post(post_refresh))
         .with_state(state)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on http://{}", addr);
-    tracing::info!("GET /  GET /api/departures  GET /api/stops  GET /api/status");
+    tracing::info!("GET /  GET /api/departures  GET /api/stops  GET /api/status  GET /api/quota  POST /api/refresh");
 
     axum::serve(listener, app).await?;
     Ok(())

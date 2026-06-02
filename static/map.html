@@ -16,6 +16,83 @@
     pointer-events: none;
   }
   #status-bar.stale { background: rgba(160,30,30,0.88); }
+  #quota-bar {
+    position: fixed; top: 42px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.55); color: #aaa; padding: 4px 12px;
+    border-radius: 20px; font-size: 11px; z-index: 1000; white-space: nowrap;
+    pointer-events: none;
+  }
+  #refresh-btn {
+    position: fixed; bottom: 80px; right: 16px;
+    width: 44px; height: 44px; border-radius: 50%;
+    background: #1565C0; color: #fff; border: none;
+    font-size: 20px; cursor: pointer; z-index: 1001;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.35);
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s;
+  }
+  #refresh-btn:disabled { background: #666; cursor: default; }
+  #refresh-btn.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Location dot */
+  .location-dot {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #4285f4; border: 2px solid #fff;
+    box-shadow: 0 0 0 0 rgba(66,133,244,0.4);
+    animation: loc-pulse 2s infinite;
+  }
+  @keyframes loc-pulse {
+    0%   { box-shadow: 0 0 0 0   rgba(66,133,244,0.4); }
+    70%  { box-shadow: 0 0 0 10px rgba(66,133,244,0);   }
+    100% { box-shadow: 0 0 0 0   rgba(66,133,244,0);   }
+  }
+
+  /* Bottom sheet */
+  #nearby-sheet {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #fff; border-radius: 16px 16px 0 0;
+    box-shadow: 0 -2px 20px rgba(0,0,0,0.18);
+    z-index: 1000;
+    transform: translateY(calc(100% - 62px));
+    transition: transform 0.3s cubic-bezier(.4,0,.2,1);
+    max-height: 75vh; display: flex; flex-direction: column;
+  }
+  #nearby-sheet.expanded { transform: translateY(0); }
+  #sheet-grip {
+    width: 36px; height: 4px; background: #ddd; border-radius: 2px;
+    margin: 10px auto 0; flex-shrink: 0; cursor: pointer;
+  }
+  #sheet-header {
+    padding: 8px 16px 10px; cursor: pointer;
+    display: flex; align-items: baseline; gap: 8px; flex-shrink: 0;
+  }
+  #sheet-title { font-weight: 700; font-size: 14px; }
+  #sheet-subtitle { font-size: 12px; color: #888; }
+  #sheet-content {
+    overflow-y: auto; padding: 0 16px 24px; flex: 1;
+  }
+  .nearby-stop {
+    margin-bottom: 12px; padding-bottom: 12px;
+    border-bottom: 1px solid #f0f0f0;
+  }
+  .nearby-stop:last-child { border-bottom: none; }
+  .nearby-stop-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 4px;
+  }
+  .nearby-stop-name { font-weight: 600; font-size: 13px; }
+  .nearby-stop-dist { font-size: 11px; color: #999; }
+  .nearby-route-row { display: flex; align-items: center; gap: 5px; margin-bottom: 2px; flex-wrap: wrap; }
+  .route-badge { background: #1565C0; color: #fff; border-radius: 4px; padding: 1px 6px; font-size: 11px; white-space: nowrap; }
+  .dep-time { font-size: 12px; color: #222; }
+  .dep-time.late { color: #b71c1c; }
+  .dep-time.cancelled { color: #aaa; text-decoration: line-through; }
+  .dep-sep { color: #ccc; font-size: 11px; }
+  .dep-head { font-size: 11px; color: #999; }
+  .no-deps { font-size: 12px; color: #bbb; font-style: italic; }
+
+  /* Stop map popup */
   .dep-popup { font-size: 13px; line-height: 1.6; min-width: 200px; }
   .dep-popup h3 { margin: 0 0 6px; font-size: 14px; }
   .dep-popup details { margin-bottom: 4px; }
@@ -27,10 +104,7 @@
   .dep-popup summary::-webkit-details-marker { display: none; }
   .dep-popup summary::before { content: '▶'; font-size: 9px; color: #999; transition: transform 0.15s; }
   .dep-popup details[open] summary::before { transform: rotate(90deg); }
-  .dep-popup summary .route-badge {
-    background: #1565C0; color: #fff; border-radius: 4px;
-    padding: 1px 6px; font-size: 12px;
-  }
+  .dep-popup summary .route-badge { background: #1565C0; color: #fff; border-radius: 4px; padding: 1px 6px; font-size: 12px; }
   .dep-popup summary .route-head { font-weight: normal; color: #555; font-size: 12px; }
   .dep-row { display: flex; justify-content: space-between; gap: 12px; padding-left: 16px; }
   .dep-row .time { color: #222; }
@@ -42,7 +116,19 @@
 </head>
 <body>
 <div id="status-bar">Loading…</div>
+<div id="quota-bar"></div>
 <div id="map"></div>
+<button id="refresh-btn" title="Refresh departures">↻</button>
+
+<div id="nearby-sheet">
+  <div id="sheet-grip"></div>
+  <div id="sheet-header">
+    <span id="sheet-title">Nearby stops</span>
+    <span id="sheet-subtitle"></span>
+  </div>
+  <div id="sheet-content"></div>
+</div>
+
 <script>
 const map = L.map('map').setView([34.048, -118.455], 13);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -57,10 +143,14 @@ const stopIcon = L.divIcon({
   iconAnchor: [5, 5],
 });
 
-let stopMap = {};      // global_stop_id → {lat, lon, stop_name}
-let markers = {};      // global_stop_id → L.marker
-let lastDeps = {};     // global_stop_id → [departure, ...]
+let stopMap = {};
+let markers = {};
+let lastDeps = {};
 let lastPolledAt = null;
+let userLat = null, userLon = null;
+let locationMarker = null;
+
+// ── Formatting helpers ──────────────────────────────────────────────────────
 
 function fmt(ts) {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -72,6 +162,21 @@ function minsFrom(ts) {
   return diff + ' min';
 }
 
+function fmtDist(m) {
+  return m < 1000 ? `${Math.round(m)}m` : `${(m / 1000).toFixed(1)}km`;
+}
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ── Map popups ──────────────────────────────────────────────────────────────
+
 function buildPopup(stopId) {
   const s = stopMap[stopId];
   const deps = lastDeps[stopId] || [];
@@ -82,7 +187,6 @@ function buildPopup(stopId) {
   if (upcoming.length === 0) {
     html += '<div class="no-deps">No upcoming departures</div>';
   } else {
-    // Group by route, preserving first-seen order
     const routeOrder = [];
     const byRoute = {};
     for (const d of upcoming) {
@@ -90,18 +194,14 @@ function buildPopup(stopId) {
       if (!byRoute[key]) { byRoute[key] = []; routeOrder.push(key); }
       byRoute[key].push(d);
     }
-
     routeOrder.forEach((routeId, idx) => {
-      const deps = byRoute[routeId];
-      const first = deps[0];
+      const rdeps = byRoute[routeId];
+      const first = rdeps[0];
       const headsign = first.headsign ? `<span class="route-head"> → ${first.headsign}</span>` : '';
-      const openAttr = idx === 0 ? ' open' : '';
-
-      html += `<details${openAttr}><summary>
+      html += `<details${idx === 0 ? ' open' : ''}><summary>
         <span class="route-badge">${first.route_short_name}</span>${headsign}
       </summary>`;
-
-      for (const d of deps.slice(0, 4)) {
+      for (const d of rdeps.slice(0, 4)) {
         const delayMin = d.delay_seconds != null ? Math.round(d.delay_seconds / 60) : null;
         const delayCls = d.is_cancelled ? 'cancelled' : (delayMin != null && delayMin > 2 ? 'late' : '');
         const delayStr = d.is_cancelled ? ' cancelled'
@@ -112,7 +212,6 @@ function buildPopup(stopId) {
           <span class="time ${delayCls}">${minsFrom(d.departure_time)} (${fmt(d.departure_time)}${delayStr})${rtBadge}</span>
         </div>`;
       }
-
       html += `</details>`;
     });
   }
@@ -125,19 +224,137 @@ function updateMarkers() {
   for (const [stopId, deps] of Object.entries(lastDeps)) {
     const s = stopMap[stopId];
     if (!s) continue;
-
     const upcoming = deps.filter(d => d.departure_time > now - 30);
     if (upcoming.length === 0) {
       if (markers[stopId]) { markers[stopId].remove(); delete markers[stopId]; }
       continue;
     }
-
     if (!markers[stopId]) {
       markers[stopId] = L.marker([s.lat, s.lon], { icon: stopIcon }).addTo(map);
     }
     markers[stopId].bindPopup(buildPopup(stopId));
   }
 }
+
+// ── Nearby sheet ────────────────────────────────────────────────────────────
+
+function getNearbyStops(maxDist = 800, limit = 8) {
+  if (userLat === null) return [];
+  return Object.entries(stopMap)
+    .map(([id, s]) => ({ id, ...s, dist: haversine(userLat, userLon, s.lat, s.lon) }))
+    .filter(s => s.dist <= maxDist)
+    .sort((a, b) => a.dist - b.dist)
+    .slice(0, limit);
+}
+
+function updateNearbySheet() {
+  const nearby = getNearbyStops();
+  const title = document.getElementById('sheet-title');
+  const subtitle = document.getElementById('sheet-subtitle');
+  const content = document.getElementById('sheet-content');
+
+  if (userLat === null) {
+    title.textContent = 'Nearby stops';
+    subtitle.textContent = 'locating…';
+    content.innerHTML = '';
+    return;
+  }
+
+  if (nearby.length === 0) {
+    title.textContent = 'No stops nearby';
+    subtitle.textContent = '';
+    content.innerHTML = '<div class="no-deps" style="padding:8px 0">No stops within 800m</div>';
+    return;
+  }
+
+  const now = Date.now() / 1000;
+  let nextDep = null;
+  for (const s of nearby) {
+    const deps = (lastDeps[s.id] || []).filter(d => d.departure_time > now);
+    if (deps.length > 0 && (!nextDep || deps[0].departure_time < nextDep.departure_time)) {
+      nextDep = deps[0];
+    }
+  }
+
+  title.textContent = `${nearby.length} stop${nearby.length > 1 ? 's' : ''} nearby`;
+  subtitle.textContent = nextDep
+    ? `next: Route ${nextDep.route_short_name} in ${minsFrom(nextDep.departure_time)}`
+    : 'no departures right now';
+
+  let html = '';
+  for (const s of nearby) {
+    const deps = (lastDeps[s.id] || []).filter(d => d.departure_time > now - 30);
+    const byRoute = {};
+    const routeOrder = [];
+    for (const d of deps) {
+      if (!byRoute[d.global_route_id]) { byRoute[d.global_route_id] = []; routeOrder.push(d.global_route_id); }
+      byRoute[d.global_route_id].push(d);
+    }
+
+    html += `<div class="nearby-stop">
+      <div class="nearby-stop-head">
+        <span class="nearby-stop-name">${s.stop_name}</span>
+        <span class="nearby-stop-dist">${fmtDist(s.dist)}</span>
+      </div>`;
+
+    if (routeOrder.length === 0) {
+      html += `<div class="no-deps">No departures</div>`;
+    } else {
+      for (const routeId of routeOrder) {
+        const rdeps = byRoute[routeId];
+        const first = rdeps[0];
+        html += `<div class="nearby-route-row">
+          <span class="route-badge">${first.route_short_name}</span>`;
+        const times = rdeps.slice(0, 3).map((d, i) => {
+          const cls = d.is_cancelled ? 'cancelled' : (d.delay_seconds > 120 ? 'late' : '');
+          return `${i > 0 ? '<span class="dep-sep"> · </span>' : ''}<span class="dep-time ${cls}">${minsFrom(d.departure_time)}</span>`;
+        }).join('');
+        html += times;
+        if (first.headsign) html += `<span class="dep-head">→ ${first.headsign}</span>`;
+        html += `</div>`;
+      }
+    }
+    html += `</div>`;
+  }
+  content.innerHTML = html;
+}
+
+// ── Sheet toggle ────────────────────────────────────────────────────────────
+
+let sheetExpanded = false;
+function toggleSheet() {
+  sheetExpanded = !sheetExpanded;
+  document.getElementById('nearby-sheet').classList.toggle('expanded', sheetExpanded);
+}
+document.getElementById('sheet-grip').addEventListener('click', toggleSheet);
+document.getElementById('sheet-header').addEventListener('click', toggleSheet);
+
+// ── Geolocation ─────────────────────────────────────────────────────────────
+
+function initLocation() {
+  if (!navigator.geolocation) return;
+  const locIcon = L.divIcon({
+    className: '',
+    html: '<div class="location-dot"></div>',
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
+  });
+
+  navigator.geolocation.watchPosition(pos => {
+    userLat = pos.coords.latitude;
+    userLon = pos.coords.longitude;
+    const latlng = [userLat, userLon];
+    if (!locationMarker) {
+      locationMarker = L.marker(latlng, { icon: locIcon, zIndexOffset: 1000 }).addTo(map);
+      map.setView(latlng, 15);
+    } else {
+      locationMarker.setLatLng(latlng);
+    }
+    updateNearbySheet();
+  }, null, { enableHighAccuracy: true, maximumAge: 30000 });
+}
+
+// ── Data loading ────────────────────────────────────────────────────────────
 
 async function loadStops() {
   const res = await fetch('/api/stops');
@@ -164,6 +381,7 @@ async function refreshDepartures() {
     }
 
     updateMarkers();
+    updateNearbySheet();
 
     const now = Math.floor(Date.now() / 1000);
     const ageSeconds = now - (data.polled_at || 0);
@@ -186,7 +404,46 @@ async function refreshDepartures() {
   }
 }
 
-loadStops().then(refreshDepartures);
+async function refreshQuota() {
+  const res = await fetch('/api/quota');
+  if (!res.ok) return;
+  const q = await res.json();
+  const bar = document.getElementById('quota-bar');
+  bar.textContent = `API calls: ${q.today_api_calls} today · ${q.total_api_calls} total`;
+}
+
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.classList.add('spinning');
+  try {
+    const res = await fetch('/api/refresh', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    lastDeps = {};
+    for (const d of data.departures || []) {
+      (lastDeps[d.global_stop_id] ??= []).push(d);
+    }
+    updateMarkers();
+    updateNearbySheet();
+    lastPolledAt = data.polled_at;
+    const bar = document.getElementById('status-bar');
+    bar.textContent = `Refreshed · ${Object.keys(lastDeps).length} active stops`;
+    bar.className = '';
+    refreshQuota();
+  } catch (e) {
+    document.getElementById('status-bar').textContent = 'Refresh failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('spinning');
+  }
+});
+
+loadStops().then(() => {
+  refreshDepartures();
+  refreshQuota();
+  initLocation();
+});
 setInterval(refreshDepartures, 30000);
 </script>
 </body>

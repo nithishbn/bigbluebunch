@@ -130,6 +130,21 @@ impl Database {
             .collect())
     }
 
+    pub async fn count_polls(&self) -> Result<(i64, i64)> {
+        let row = sqlx::query(
+            "SELECT
+               COUNT(DISTINCT polled_at) AS total,
+               COUNT(DISTINCT polled_at) FILTER (
+                 WHERE polled_at >= EXTRACT(EPOCH FROM date_trunc('day', now()))::bigint
+               ) AS today
+             FROM departure_log",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to count polls")?;
+        Ok((row.get("total"), row.get("today")))
+    }
+
     pub async fn insert_departure_log(
         &self,
         polled_at: i64,
