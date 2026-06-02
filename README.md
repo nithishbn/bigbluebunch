@@ -1,307 +1,239 @@
-# Big Blue Bus Route 1 Bunching Tracker
+# Big Blue Bus Transit Tracker
 
-Automated monitoring system for Big Blue Bus Route 1 that polls GTFS real-time data every 60 seconds to document bus bunching incidents and service reliability issues.
+Local transit data mirror for West LA bus advocacy. Polls the Transit App API for real-time
+departure predictions across Big Blue Bus Route 1, Culver CityBus 6R, and key watch-point
+stops for routes 6 and 17. Stores everything in SQLite and serves it through a local Axum
+API so downstream apps (e-ink dashboard, analysis scripts) don't burn API quota.
 
 ## Motivation
 
-I'm a UCLA PhD student who regularly rides Big Blue Bus Route 1 from Westwood to campus. The service is extremely unreliable:
+Big Blue Bus Route 1 (Westwood ↔ UCLA) has severe reliability problems:
 
-- **Bus bunching**: Multiple buses arrive together (sometimes 2-3 buses within 1 minute), then 20-40+ minute gaps
-- **Terminus bunching**: Buses leave UCLA (the route terminus) bunched together, even before traffic is a factor
-- **Ghost buses**: Buses that show up in Transit app but never arrive
-- **Driver variability**: Same trip takes 15-25 minutes depending on how aggressively the driver merges into traffic
-- **Service gaps**: I've experienced 42-minute gaps after bunched buses, forcing me to take expensive Uber rides
+- **Bus bunching** — two or three buses arrive within one minute, followed by 20–40+ minute gaps
+- **Terminus bunching** — buses leave UCLA already bunched, before traffic is even a factor
+- **Ghost buses** — shows up in Transit app, never arrives
+- **42-minute service gaps** have been personally documented
 
-**Goal**: Document these failures with comprehensive data to advocate for:
-1. Better Big Blue Bus operational management (dispatching, recovery time)
-2. Dedicated bus lanes on Santa Monica Blvd
-3. Signal priority for buses
+This tool collects continuous departure data to support advocacy at LA City Council, Santa Monica
+City Council, and Metro Board for dedicated bus lanes, signal priority, and a Route 1 rapid
+equivalent (similar to how 6R compares to local 6).
+
+## Architecture
+
+```
+Transit App API  ──(bootstrap, once)──▶  route_details   ──▶  stops table
+                 ──(every 15 min) ────▶  stop_departures  ──▶  departure_log table
+                                                               │
+                                                         Axum API server
+                                                         GET /api/departures
+                                                         GET /api/status
+```
+
+### Two binaries
+
+| Binary | Command | Purpose |
+|--------|---------|---------|
+| `server` | `cargo run --bin server` | Polling loop + API server (runs continuously) |
+| `bigbluebunch` | `cargo run --bin bigbluebunch` | CLI helpers (--discover, --resolve-stops) |
+
+### Poll loop
+
+- **Active window**: 7–10am and 4–7pm, **weekdays only**
+- **Interval**: 15 minutes (900 s)
+- **Rate limiting**: 13-second delay between every API call
+- **Budget**: ~48 calls/day × 22 weekdays = ~1056/month (well under the 1500/month cap)
+- Polls immediately on startup so the cache is never empty at launch
+
+### Bootstrap (runs once, ever)
+
+On first run the `stops` table is empty. The server fetches `route_details` for each route
+in `ROUTE_IDS` (one API call per route, 13 s apart) to populate all stop coordinates. After
+bootstrap the stops table is never written again — the data is static.
+
+### Stop coverage
+
+| Source | Routes | How |
+|--------|--------|-----|
+| `ROUTE_IDS` bootstrap | Route 1 (BBB:14412), 6R (CCBCA:77951) | Full route, all stops |
+| `EXTRA_STOP_IDS` | Routes 6, 17, LADOT, others | Specific watch-point stops only |
+
+Each `stop_departures` call accepts up to 100 stop IDs. With ~150 total stops the poll fits
+in 2 API calls per cycle.
 
 ## Quick Start
 
 ```bash
-# Build the project
-cargo build --release
+# 1. Copy and fill in the env file
+cp .env.example .env   # set TRANSIT_API_KEY, ROUTE_IDS, EXTRA_STOP_IDS
 
-# Run the tracker
-cargo run --release
+# 2. Start the server (Nix shell recommended)
+nix develop --command cargo run --bin server
 
-# Run with debug logging
-RUST_LOG=debug cargo run --release
+# Query the API
+curl http://localhost:8080/api/status
+curl "http://localhost:8080/api/departures?stop_ids=BBB:7023,MLA:107070"
 ```
 
-The tracker will:
-- Poll the GTFS-RT API every 60 seconds
-- Filter for Route 1 buses
-- Display current bus positions in logs
-- Save observations to SQLite database (`bus_tracking.db`)
+### Environment variables
 
-## Architecture
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TRANSIT_API_KEY` | yes | Transit App public API key |
+| `ROUTE_IDS` | yes | Comma-separated global route IDs to bootstrap (e.g. `BBB:14412,CCBCA:77951`) |
+| `EXTRA_STOP_IDS` | no | Additional stop IDs to poll (watch-point stops for routes not bootstrapped) |
+| `PORT` | no | API server port (default: 8080) |
+| `RUST_LOG` | no | Log level (default: info) |
 
-### Data Flow
+### CLI helpers
 
+```bash
+# Find route IDs near UCLA
+cargo run --bin bigbluebunch -- --discover
+
+# Find stop IDs near a GPS coordinate
+cargo run --bin bigbluebunch -- --resolve-stops 34.0689 -118.4452
 ```
-GTFS-RT API → HTTP Fetch → Protobuf Parse → Filter Route 1 → SQLite Storage
-     ↑                                                              ↓
-     └──────────────── 60 second interval ─────────────────────────┘
+
+## API
+
+### `GET /api/departures`
+
+Returns the latest poll results from the in-memory cache. Returns 503 if no poll has completed yet.
+
+**Query params**: `stop_ids` — comma-separated global stop IDs to filter by (optional; omit for all stops)
+
+```bash
+curl "http://localhost:8080/api/departures?stop_ids=BBB:7023,MLA:107070"
 ```
 
-### Components
+```json
+{
+  "polled_at": 1748123456,
+  "departures": [
+    {
+      "global_stop_id": "BBB:7023",
+      "global_route_id": "BBB:14412",
+      "route_short_name": "1",
+      "headsign": "UCLA",
+      "departure_time": 1748123600,
+      "scheduled_departure_time": 1748123580,
+      "delay_seconds": 20,
+      "is_real_time": true,
+      "is_cancelled": false,
+      "rt_trip_id": "2047030_1355_76320"
+    }
+  ]
+}
+```
 
-#### 1. API Client (`src/api.rs`)
-- Fetches vehicle positions from: `http://gtfs.bigbluebus.com/vehiclepositions.bin`
-- Decodes Protocol Buffer format using `prost`
-- Parses GTFS-RT feed into structured data
-- Filters for Route 1 buses
-- Returns `Vec<BusObservation>` for each poll
+### `GET /api/status`
 
-#### 2. Data Models (`src/models.rs`)
-
-**`BusObservation`**: Represents a single bus position with metadata
-- `timestamp`: Unix timestamp when observation was recorded
-- `vehicle_id`: Unique vehicle identifier (bus number)
-- `route_id`: Route identifier (e.g., "1" for Route 1)
-- `latitude`, `longitude`: GPS coordinates
-- `trip_id`: GTFS trip identifier
-- `direction_id`: Direction of travel (0 or 1)
-- `current_stop_sequence`: Which stop bus is at/approaching
-- `speed`: Speed in meters per second
-- `bearing`: Heading in degrees
-
-**`PollStats`**: Statistics about each polling cycle
-- `total_vehicles`: All vehicles in feed
-- `route_1_vehicles`: Count of Route 1 buses
-- `timestamp`: When poll occurred
-
-#### 3. Database (`src/db.rs`)
-- SQLite storage using `sqlx` with async transactions
-- Connection pooling (max 5 connections)
-- Batch inserts for efficiency
-- Query methods for statistics
-
-#### 4. Main Loop (`src/main.rs`)
-- Tokio async runtime for concurrency
-- 60-second polling interval using `tokio::time::interval`
-- Graceful error handling with retry logic
-- Structured logging with `log` and `env_logger`
-
-### Protobuf Setup
-
-GTFS-realtime uses Protocol Buffers for efficient binary serialization:
-
-1. **`proto/gtfs-realtime.proto`**: Official GTFS-RT schema from Google Transit
-2. **`build.rs`**: Compile-time code generation using `prost-build`
-3. **Generated code**: Rust structs in `$OUT_DIR/transit_realtime.rs`
-4. **Usage**: Import generated types in `src/api.rs` as `gtfs_realtime` module
-
-The build script runs before compilation and generates strongly-typed Rust structs from the protobuf definition.
+```json
+{
+  "status": "ok",
+  "last_polled_at": 1748123456,
+  "departure_count": 2700,
+  "timestamp": 1748123500
+}
+```
 
 ## Database Schema
 
 ```sql
-CREATE TABLE observations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
-    vehicle_id TEXT NOT NULL,
-    route_id TEXT NOT NULL,
-    trip_id TEXT,
-    direction_id INTEGER,
-    latitude REAL NOT NULL,
-    longitude REAL NOT NULL,
-    current_stop_sequence INTEGER,
-    speed REAL,
-    bearing REAL
+-- Static stop metadata, bootstrapped once
+CREATE TABLE stops (
+    global_stop_id TEXT PRIMARY KEY,
+    stop_name TEXT NOT NULL,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL
 );
 
-CREATE INDEX idx_timestamp ON observations(timestamp);
-CREATE INDEX idx_vehicle ON observations(vehicle_id);
+-- Append-only departure log, one row per departure per poll
+CREATE TABLE departure_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    polled_at INTEGER NOT NULL,       -- Unix timestamp of poll
+    global_stop_id TEXT NOT NULL,
+    global_route_id TEXT NOT NULL,
+    route_short_name TEXT NOT NULL,
+    headsign TEXT,
+    departure_time INTEGER NOT NULL,
+    scheduled_departure_time INTEGER NOT NULL,
+    delay_seconds INTEGER,
+    is_real_time INTEGER NOT NULL DEFAULT 0,
+    is_cancelled INTEGER NOT NULL DEFAULT 0,
+    rt_trip_id TEXT
+);
+
+CREATE INDEX idx_log_polled_at ON departure_log(polled_at);
+CREATE INDEX idx_log_stop ON departure_log(global_stop_id, departure_time);
 ```
 
-### Design Decisions
-
-- **Unix timestamps**: Integer storage, easy to query by date/time ranges
-- **Nullable fields**: Some GTFS-RT fields are optional (trip_id, direction_id, etc.)
-- **Indexes**: On `timestamp` for time-series queries, `vehicle_id` for tracking specific buses
-- **No foreign keys**: Simple append-only schema for reliability
-
-## Dependencies
-
-### Runtime Dependencies
-- **tokio** (v1): Async runtime with full features
-- **reqwest** (v0.11): HTTP client for API requests
-- **prost** (v0.12): Protocol Buffer parser
-- **prost-types** (v0.12): Well-known protobuf types
-- **bytes** (v1): Efficient byte buffer handling
-- **sqlx** (v0.8): Async SQLite with connection pooling
-- **chrono** (v0.4): Timestamp parsing and formatting
-- **anyhow** (v1): Ergonomic error handling
-- **log** (v0.4): Logging facade
-- **env_logger** (v0.11): Environment-based log configuration
-- **serde** (v1): Serialization framework
-- **serde_json** (v1): JSON support
-
-### Build Dependencies
-- **prost-build** (v0.12): Protobuf code generation
-
-## Usage
-
-### Running the Tracker
-
-```bash
-# Standard run with info-level logging
-cargo run --release
-
-# Debug mode for verbose logging
-RUST_LOG=debug cargo run --release
-
-# Specific module logging
-RUST_LOG=bigbluebunch::api=debug cargo run --release
-```
-
-### Querying the Database
+### Useful queries
 
 ```bash
 sqlite3 bus_tracking.db
 ```
 
-#### Useful Queries
-
 ```sql
--- Total observations
-SELECT COUNT(*) FROM observations;
+-- How many departures logged total?
+SELECT COUNT(*) FROM departure_log;
 
--- Observations per day
-SELECT DATE(timestamp, 'unixepoch') as date, COUNT(*)
-FROM observations
-GROUP BY date;
+-- Departures per poll session
+SELECT datetime(polled_at, 'unixepoch') as time, COUNT(*) as deps
+FROM departure_log GROUP BY polled_at ORDER BY polled_at DESC LIMIT 20;
 
--- Unique vehicles tracked
-SELECT COUNT(DISTINCT vehicle_id) FROM observations;
-
--- Recent Route 1 observations
+-- Average delay for Route 1 at a specific stop
 SELECT
-    datetime(timestamp, 'unixepoch') as time,
-    vehicle_id,
-    latitude,
-    longitude,
-    speed
-FROM observations
-WHERE route_id = '1'
-ORDER BY timestamp DESC
-LIMIT 10;
+    route_short_name,
+    AVG(delay_seconds) / 60.0 as avg_delay_min,
+    COUNT(*) as samples
+FROM departure_log
+WHERE global_stop_id = 'BBB:7023'
+  AND route_short_name = '1'
+  AND is_real_time = 1
+GROUP BY route_short_name;
 
--- Observations by hour of day
+-- Service gaps: time between consecutive Route 1 departures at a stop
+WITH t AS (
+    SELECT departure_time,
+           LAG(departure_time) OVER (ORDER BY departure_time) as prev
+    FROM departure_log
+    WHERE global_stop_id = 'BBB:7023' AND route_short_name = '1'
+)
 SELECT
-    strftime('%H', timestamp, 'unixepoch') as hour,
-    COUNT(*) as count
-FROM observations
-WHERE route_id = '1'
-GROUP BY hour
-ORDER BY hour;
+    datetime(departure_time, 'unixepoch') as at,
+    (departure_time - prev) / 60.0 as gap_min
+FROM t WHERE prev IS NOT NULL ORDER BY gap_min DESC LIMIT 20;
 ```
-
-### Exporting Data
-
-```sql
-.mode csv
-.output observations.csv
-SELECT * FROM observations;
-.quit
-```
-
-Export to CSV for analysis with Python (pandas), R, or Excel.
-
-## GTFS-RT API Details
-
-### Endpoint
-- **URL**: `http://gtfs.bigbluebus.com/vehiclepositions.bin`
-- **Method**: GET
-- **Format**: Protocol Buffer (binary)
-- **Authentication**: None required (public endpoint)
-- **CORS**: Enabled (`Access-Control-Allow-Origin: *`)
-- **Update Frequency**: Approximately 30-60 seconds
-- **Content-Type**: `application/octet-stream`
-
-### Additional Endpoints
-- **Trip Updates**: `http://gtfs.bigbluebus.com/tripupdates.bin`
-- **Alerts**: `http://gtfs.bigbluebus.com/alerts.bin`
-
-### Response Structure
-
-The GTFS-RT feed returns a `FeedMessage` containing vehicle position entities:
-
-```
-FeedMessage
-├── header
-│   └── timestamp (feed generation time)
-└── entity[] (array of vehicles)
-    └── vehicle
-        ├── trip
-        │   ├── trip_id: String
-        │   ├── route_id: String (filter for "1")
-        │   └── direction_id: Integer (0 or 1)
-        ├── vehicle
-        │   └── id: String (bus number)
-        ├── position
-        │   ├── latitude: Float
-        │   ├── longitude: Float
-        │   ├── bearing: Float (degrees)
-        │   └── speed: Float (m/s)
-        ├── timestamp: Integer (Unix time)
-        └── current_stop_sequence: Integer
-```
-
-### Parsing Flow
-
-1. **Fetch**: HTTP GET request to endpoint
-2. **Decode**: Parse binary protobuf using `prost::Message::decode()`
-3. **Extract**: Iterate through `feed.entity` array
-4. **Filter**: Check `route_id == "1"`
-5. **Transform**: Map protobuf types to `BusObservation` structs
-6. **Store**: Batch insert into SQLite
-
-## Error Handling
-
-The application uses graceful degradation to handle failures without crashing:
-
-### Network Errors
-- **Timeout**: Log error, wait for next interval
-- **Connection refused**: Log error, retry on next poll
-- **HTTP error codes**: Log status code, continue polling
-
-### Parse Errors
-- **Malformed protobuf**: Log error with context, skip this poll
-- **Missing required fields**: Skip individual entity, continue processing others
-
-### Database Errors
-- **Connection failure**: Log error, attempt reconnection
-- **Insert failure**: Log error, continue to next poll
-- **Transaction rollback**: Data consistency maintained
-
-### Design Philosophy
-**Never crash on transient failures.** The application is designed to run continuously for weeks, handling temporary API outages, network issues, and malformed data gracefully.
 
 ## Project Structure
 
 ```
 bigbluebunch/
-├── Cargo.toml              # Dependencies and project metadata
-├── build.rs                # Protobuf code generation script
-├── proto/
-│   └── gtfs-realtime.proto # GTFS-RT protocol buffer definition
+├── Cargo.toml
+├── flake.nix                  # Nix dev shell (rustc, sqlx-cli, jq, protobuf)
+├── .env                       # API key + route/stop config (not committed)
+├── bus_tracking.db            # SQLite database (created at runtime)
 ├── src/
-│   ├── main.rs            # Entry point and polling loop
-│   ├── api.rs             # GTFS-RT API client
-│   ├── db.rs              # SQLite database layer
-│   └── models.rs          # Data structures and types
-├── bus_tracking.db        # SQLite database (created at runtime)
-└── README.md              # This file
+│   ├── lib.rs                 # Module exports
+│   ├── main.rs                # CLI binary (--discover, --resolve-stops)
+│   ├── api.rs                 # Transit App API client
+│   ├── api_server.rs          # Axum server (/api/departures, /api/status)
+│   ├── db.rs                  # SQLite layer (stops + departure_log)
+│   ├── models.rs              # Stop, Departure, PollResult structs
+│   └── bin/
+│       └── server.rs          # Server binary (poll loop + HTTP server)
+└── proto/
+    └── gtfs-realtime.proto    # Kept for reference (not currently used)
 ```
 
-## Expected Data Collection
+## Transit App API
 
-Running continuously for 3 weeks:
-- **Polls**: ~30,240 (60s interval × 60 min × 24 hr × 21 days)
-- **Observations**: 3,000-5,000+ Route 1 observations (varies by service hours)
-- **Database size**: ~500KB-2MB (depending on observation count)
-- **Unique vehicles**: 10-20 different buses
+Base URL: `https://external.transitapp.com/v4/public`
+
+| Endpoint | Calls/month | When |
+|----------|-------------|------|
+| `route_details?global_route_id=X` | 2 (once, on bootstrap) | First run only |
+| `stop_departures?global_stop_ids=...` | ~1056 (2/poll × 24 polls/day × 22 days) | Every active window |
+
+Rate limit: 5 calls/minute. The server enforces 13 s between every call.
