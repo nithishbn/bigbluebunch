@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>West LA Transit — Live Departures</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; font-family: sans-serif; background: #111; }
+  #map { height: 100vh; }
+  #status-bar {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.78); color: #eee; padding: 6px 16px;
+    border-radius: 20px; font-size: 12px; z-index: 1000; white-space: nowrap;
+    pointer-events: none;
+  }
+  #status-bar.stale { background: rgba(160,30,30,0.88); }
+  .dep-popup { font-size: 13px; line-height: 1.6; min-width: 180px; }
+  .dep-popup h3 { margin: 0 0 6px; font-size: 14px; }
+  .dep-row { display: flex; justify-content: space-between; gap: 12px; }
+  .dep-row .route { font-weight: bold; color: #1565C0; min-width: 28px; }
+  .dep-row .time { color: #222; }
+  .dep-row .rt { color: #2e7d32; font-size: 11px; }
+  .dep-row .late { color: #b71c1c; }
+  .dep-row .cancelled { color: #999; text-decoration: line-through; }
+  .no-deps { color: #888; font-style: italic; }
+</style>
+</head>
+<body>
+<div id="status-bar">Loading…</div>
+<div id="map"></div>
+<script>
+const map = L.map('map').setView([34.048, -118.455], 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OpenStreetMap contributors',
+  maxZoom: 19,
+}).addTo(map);
+
+const stopIcon = L.divIcon({
+  className: '',
+  html: '<div style="width:11px;height:11px;border-radius:50%;background:#1565C0;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.6)"></div>',
+  iconSize: [11, 11],
+  iconAnchor: [5, 5],
+});
+
+let stopMap = {};      // global_stop_id → {lat, lon, stop_name}
+let markers = {};      // global_stop_id → L.marker
+let lastDeps = {};     // global_stop_id → [departure, ...]
+let lastPolledAt = null;
+
+function fmt(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function minsFrom(ts) {
+  const diff = Math.round((ts - Date.now() / 1000) / 60);
+  if (diff <= 0) return 'now';
+  return diff + ' min';
+}
+
+function buildPopup(stopId) {
+  const s = stopMap[stopId];
+  const deps = lastDeps[stopId] || [];
+  const now = Date.now() / 1000;
+  const upcoming = deps.filter(d => d.departure_time > now - 30).slice(0, 5);
+
+  let html = `<div class="dep-popup"><h3>${s.stop_name}</h3>`;
+  if (upcoming.length === 0) {
+    html += '<div class="no-deps">No upcoming departures</div>';
+  } else {
+    for (const d of upcoming) {
+      const delayMin = d.delay_seconds != null ? Math.round(d.delay_seconds / 60) : null;
+      const delayCls = d.is_cancelled ? 'cancelled' : (delayMin != null && delayMin > 2 ? 'late' : '');
+      const delayStr = d.is_cancelled ? ' cancelled'
+        : (d.is_real_time && delayMin != null && delayMin !== 0
+            ? ` ${delayMin > 0 ? '+' : ''}${delayMin}m` : '');
+      const rtBadge = d.is_real_time && !d.is_cancelled ? '<span class="rt"> ●</span>' : '';
+      const title = d.headsign ? ` title="→ ${d.headsign}"` : '';
+      html += `<div class="dep-row">
+        <span class="route"${title}>${d.route_short_name}</span>
+        <span class="time ${delayCls}">${minsFrom(d.departure_time)} (${fmt(d.departure_time)}${delayStr})${rtBadge}</span>
+      </div>`;
+    }
+  }
+  html += `<div style="font-size:10px;color:#aaa;margin-top:6px">${stopId}</div></div>`;
+  return html;
+}
+
+function updateMarkers() {
+  const now = Date.now() / 1000;
+  for (const [stopId, deps] of Object.entries(lastDeps)) {
+    const s = stopMap[stopId];
+    if (!s) continue;
+
+    const upcoming = deps.filter(d => d.departure_time > now - 30);
+    if (upcoming.length === 0) {
+      if (markers[stopId]) { markers[stopId].remove(); delete markers[stopId]; }
+      continue;
+    }
+
+    if (!markers[stopId]) {
+      markers[stopId] = L.marker([s.lat, s.lon], { icon: stopIcon }).addTo(map);
+    }
+    markers[stopId].bindPopup(buildPopup(stopId));
+  }
+}
+
+async function loadStops() {
+  const res = await fetch('/api/stops');
+  if (!res.ok) return;
+  const stops = await res.json();
+  for (const s of stops) stopMap[s.global_stop_id] = s;
+}
+
+async function refreshDepartures() {
+  const bar = document.getElementById('status-bar');
+  try {
+    const res = await fetch('/api/departures');
+    if (res.status === 503) {
+      bar.textContent = 'Waiting for first poll…';
+      bar.className = '';
+      return;
+    }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    lastDeps = {};
+    for (const d of data.departures || []) {
+      (lastDeps[d.global_stop_id] ??= []).push(d);
+    }
+
+    updateMarkers();
+
+    const now = Math.floor(Date.now() / 1000);
+    const ageSeconds = now - (data.polled_at || 0);
+    const ageMin = Math.round(ageSeconds / 60);
+    const stale = ageSeconds > 1200;
+    const stopCount = Object.keys(lastDeps).length;
+
+    if (lastPolledAt !== null && data.polled_at !== lastPolledAt) {
+      bar.style.transition = 'background 0.3s';
+      bar.style.background = 'rgba(30, 120, 30, 0.85)';
+      setTimeout(() => { bar.style.background = ''; }, 1500);
+    }
+    lastPolledAt = data.polled_at;
+
+    bar.textContent = `${stopCount} active stops · updated ${fmt(data.polled_at)} · data is ${ageMin} min old`;
+    bar.className = stale ? 'stale' : '';
+  } catch (e) {
+    bar.textContent = 'Error: ' + e.message;
+    bar.className = 'stale';
+  }
+}
+
+loadStops().then(refreshDepartures);
+setInterval(refreshDepartures, 30000);
+</script>
+</body>
+</html>

@@ -117,6 +117,23 @@ impl Database {
         Ok(rows.iter().map(|r| r.get("global_stop_id")).collect())
     }
 
+    pub async fn get_all_stops(&self) -> Result<Vec<Stop>> {
+        let rows = sqlx::query("SELECT global_stop_id, stop_name, lat, lon FROM stops")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to query stops")?;
+
+        Ok(rows
+            .iter()
+            .map(|r| Stop {
+                global_stop_id: r.get("global_stop_id"),
+                stop_name: r.get("stop_name"),
+                lat: r.get("lat"),
+                lon: r.get("lon"),
+            })
+            .collect())
+    }
+
     pub async fn insert_departure_log(
         &self,
         polled_at: i64,
@@ -155,4 +172,5 @@ impl Database {
         tx.commit().await.context("Failed to commit departure log")?;
         Ok(departures.len())
     }
+
 }

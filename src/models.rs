@@ -27,3 +27,4 @@ pub struct PollResult {
     pub polled_at: i64,
     pub departures: Vec<Departure>,
 }
+

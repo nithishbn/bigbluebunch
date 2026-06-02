@@ -1,8 +1,8 @@
 use anyhow::Result;
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::Json,
+    http::{header, StatusCode},
+    response::{Html, IntoResponse, Json},
     routing::get,
     Router,
 };
@@ -11,13 +11,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::models::PollResult;
+use crate::models::{PollResult, Stop};
 
 pub type Cache = Arc<RwLock<Option<PollResult>>>;
 
 #[derive(Clone)]
 struct AppState {
     cache: Cache,
+    stops: Arc<Vec<Stop>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -26,8 +27,6 @@ struct DepartureParams {
 }
 
 /// GET /api/departures?stop_ids=BBB:1234,BBB:5678
-/// Returns the latest poll departures, optionally filtered to specific stops.
-/// 503 if no poll has completed yet.
 async fn get_departures(
     State(state): State<AppState>,
     Query(params): Query<DepartureParams>,
@@ -53,6 +52,11 @@ async fn get_departures(
     }
 }
 
+/// GET /api/stops — static stop list with coordinates
+async fn get_stops(State(state): State<AppState>) -> Json<Vec<Stop>> {
+    Json((*state.stops).clone())
+}
+
 /// GET /api/status
 async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cache = state.cache.read().await;
@@ -60,12 +64,21 @@ async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "last_polled_at": cache.as_ref().map(|p| p.polled_at),
         "departure_count": cache.as_ref().map(|p| p.departures.len()),
+        "stop_count": state.stops.len(),
         "timestamp": chrono::Utc::now().timestamp(),
     }))
 }
 
-pub async fn run_server(addr: &str, cache: Cache) -> Result<()> {
-    let state = AppState { cache };
+/// GET / — departure map
+async fn get_map() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Html(MAP_HTML),
+    )
+}
+
+pub async fn run_server(addr: &str, cache: Cache, stops: Arc<Vec<Stop>>) -> Result<()> {
+    let state = AppState { cache, stops };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -73,15 +86,19 @@ pub async fn run_server(addr: &str, cache: Cache) -> Result<()> {
         .allow_headers(Any);
 
     let app = Router::new()
+        .route("/", get(get_map))
         .route("/api/departures", get(get_departures))
+        .route("/api/stops", get(get_stops))
         .route("/api/status", get(get_status))
         .with_state(state)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Listening on http://{}", addr);
-    tracing::info!("GET /api/departures?stop_ids=A,B  GET /api/status");
+    tracing::info!("GET /  GET /api/departures  GET /api/stops  GET /api/status");
 
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+const MAP_HTML: &str = include_str!("../static/map.html");

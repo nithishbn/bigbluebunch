@@ -1,15 +1,20 @@
 use anyhow::Result;
 use bigbluebunch::{api::TransitClient, api_server, db::Database, models::PollResult};
-use chrono::{Local, Timelike};
+use chrono::{Datelike, Local, Timelike, Weekday};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-// 15 minutes → 24 polls/day × 2 calls/poll = 48 calls/day (~1440/month)
+// 15 min → 24 polls/day × 2 calls/poll × 22 weekdays = ~1056 calls/month
 const POLL_INTERVAL_SECS: u64 = 900;
 
 fn is_active_window() -> bool {
-    let h = Local::now().hour();
+    let now = Local::now();
+    match now.weekday() {
+        Weekday::Sat | Weekday::Sun => return false,
+        _ => {}
+    }
+    let h = now.hour();
     (h >= 7 && h < 10) || (h >= 16 && h < 19)
 }
 
@@ -43,7 +48,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Extra stop IDs (specific stops for routes not fully bootstrapped, e.g. Route 6, 17)
     let extra_stop_ids: Vec<String> = std::env::var("EXTRA_STOP_IDS")
         .unwrap_or_default()
         .split(',')
@@ -62,8 +66,7 @@ async fn main() -> Result<()> {
     let db = Arc::new(Database::new("bus_tracking.db").await?);
     let cache: api_server::Cache = Arc::new(RwLock::new(None));
 
-    // Bootstrap: seed stops from route_details if table is empty.
-    // Each route costs 1 API call, runs once ever.
+    // Bootstrap stops from route_details if table is empty (1 API call per route, once ever)
     if !db.stops_initialized().await? {
         tracing::info!(routes = route_ids.len(), "Bootstrapping stops from route_details");
         for (i, route_id) in route_ids.iter().enumerate() {
@@ -80,11 +83,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        // Wait before the first poll so we don't immediately spike over 5/min
         tokio::time::sleep(Duration::from_secs(13)).await;
     }
 
-    // Merge DB stop IDs with extra stop IDs, deduplicating
+    // Build stop ID list for polling (DB stops + EXTRA_STOP_IDS, deduplicated)
     let mut stop_ids = db.get_all_stop_ids().await?;
     let existing: std::collections::HashSet<_> = stop_ids.iter().cloned().collect();
     for id in &extra_stop_ids {
@@ -97,33 +99,39 @@ async fn main() -> Result<()> {
         anyhow::bail!("No stops configured — check ROUTE_IDS and EXTRA_STOP_IDS");
     }
 
+    // Load full stop metadata (with coordinates) for the map
+    let stops = Arc::new(db.get_all_stops().await?);
+
     tracing::info!(
         stops = stop_ids.len(),
         chunks = stop_ids.chunks(100).count(),
         interval_secs = POLL_INTERVAL_SECS,
-        "Ready — polling active 7–10am and 4–7pm"
+        "Ready — polling active weekdays 7–10am and 4–7pm"
     );
 
-    let client_poll = Arc::clone(&client);
-    let db_poll = Arc::clone(&db);
-    let cache_poll = Arc::clone(&cache);
+    // ── Departures poll task ─────────────────────────────────────────────────
+    {
+        let client_poll = Arc::clone(&client);
+        let db_poll = Arc::clone(&db);
+        let cache_poll = Arc::clone(&cache);
+        let stop_ids = stop_ids.clone();
 
-    tokio::spawn(async move {
-        // Poll immediately on startup so the cache isn't empty
-        do_poll(&client_poll, &db_poll, &cache_poll, &stop_ids).await;
-
-        let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if !is_active_window() {
-                continue;
-            }
+        tokio::spawn(async move {
             do_poll(&client_poll, &db_poll, &cache_poll, &stop_ids).await;
-        }
-    });
 
-    api_server::run_server(&addr, cache).await?;
+            let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !is_active_window() {
+                    continue;
+                }
+                do_poll(&client_poll, &db_poll, &cache_poll, &stop_ids).await;
+            }
+        });
+    }
+
+    api_server::run_server(&addr, cache, stops).await?;
     Ok(())
 }
 
@@ -143,7 +151,7 @@ async fn do_poll(
         match client.fetch_stop_departures(chunk).await {
             Ok(deps) => all_departures.extend(deps),
             Err(e) => {
-                tracing::error!(error = %e, "Poll failed");
+                tracing::error!(error = %e, "Departures poll failed");
                 return;
             }
         }
