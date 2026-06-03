@@ -16,7 +16,7 @@ fn is_active_window() -> bool {
         _ => {}
     }
     let h = now.hour();
-    (h >= 7 && h < 10) || (h >= 16 && h < 19)
+    (h >= 8 && h < 11) || (h >= 15 && h < 18)
 }
 
 #[tokio::main]
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
         stops = stop_ids.len(),
         chunks = stop_ids.chunks(100).count(),
         interval_secs = POLL_INTERVAL_SECS,
-        "Ready — polling active weekdays 7–10am and 4–7pm"
+        "Ready — polling active weekdays 8–11am and 3–6pm"
     );
 
     let chunks_per_poll = stop_ids.chunks(100).count();
