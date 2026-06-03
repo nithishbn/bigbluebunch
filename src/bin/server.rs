@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bigbluebunch::{api::TransitClient, api_server, db::Database, poll_once};
-use chrono::{Datelike, Local, Timelike, Weekday};
+use chrono::{Datelike, Timelike, Utc, Weekday};
+use chrono_tz::US::Pacific;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use tokio::sync::RwLock;
 const POLL_INTERVAL_SECS: u64 = 900;
 
 fn is_active_window() -> bool {
-    let now = Local::now();
+    let now = Utc::now().with_timezone(&Pacific);
     match now.weekday() {
         Weekday::Sat | Weekday::Sun => return false,
         _ => {}
@@ -155,19 +156,25 @@ async fn main() -> Result<()> {
         let stop_ids_poll = stop_ids.clone();
 
         tokio::spawn(async move {
-            if let Some(result) = poll_once(&client_poll, &db_poll, &stop_ids_poll, true).await {
-                *cache_poll.write().await = Some(result);
-            }
-
-            let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                // Sleep until the next 15-minute boundary (:00, :15, :30, :45)
+                let now = Utc::now();
+                let secs_into_interval = (now.timestamp() % POLL_INTERVAL_SECS as i64) as u64;
+                let secs_until_next = POLL_INTERVAL_SECS - secs_into_interval;
+                tokio::time::sleep(Duration::from_secs(secs_until_next)).await;
+
                 if !is_active_window() {
                     continue;
                 }
-                if let Some(result) = poll_once(&client_poll, &db_poll, &stop_ids_poll, true).await {
-                    *cache_poll.write().await = Some(result);
+                match tokio::time::timeout(
+                    Duration::from_secs(POLL_INTERVAL_SECS),
+                    poll_once(&client_poll, &db_poll, &stop_ids_poll, true),
+                )
+                .await
+                {
+                    Ok(Some(result)) => *cache_poll.write().await = Some(result),
+                    Ok(None) => tracing::warn!("Poll returned no result"),
+                    Err(_) => tracing::error!("Poll timed out after {}s", POLL_INTERVAL_SECS),
                 }
             }
         });

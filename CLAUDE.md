@@ -17,6 +17,20 @@ This data will support advocacy at LA City Council, Santa Monica City Council, a
 
 ## Technical Implementation
 
+### Polling Schedule
+
+The poller runs every 15 minutes on clean clock boundaries (:00, :15, :30, :45) anchored to Unix epoch — not to boot time. This ensures polls are predictable regardless of when the container starts or restarts.
+
+Active windows (Pacific time, weekdays only):
+- **8–11am** (commute AM)
+- **3–6pm** (commute PM)
+
+Outside these windows the loop sleeps 60 seconds between window checks. A `tokio::time::timeout` equal to the poll interval prevents a hung poll from blocking the next tick.
+
+**Implementation**: `src/bin/server.rs` — `is_active_window()` + the spawned poll task.
+
+---
+
 ### Core Architecture
 
 The application follows a simple poll-process-store loop:
