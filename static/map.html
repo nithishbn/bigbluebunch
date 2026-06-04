@@ -143,6 +143,13 @@ const stopIcon = L.divIcon({
   iconAnchor: [5, 5],
 });
 
+const stopIconGrey = L.divIcon({
+  className: '',
+  html: '<div style="width:9px;height:9px;border-radius:50%;background:#666;border:2px solid #444;box-shadow:0 1px 3px rgba(0,0,0,.4)"></div>',
+  iconSize: [9, 9],
+  iconAnchor: [4, 4],
+});
+
 let stopMap = {};
 let markers = {};
 let lastDeps = {};
@@ -221,16 +228,14 @@ function buildPopup(stopId) {
 
 function updateMarkers() {
   const now = Date.now() / 1000;
-  for (const [stopId, deps] of Object.entries(lastDeps)) {
-    const s = stopMap[stopId];
-    if (!s) continue;
+  for (const [stopId, s] of Object.entries(stopMap)) {
+    const deps = lastDeps[stopId] || [];
     const upcoming = deps.filter(d => d.departure_time > now - 30);
-    if (upcoming.length === 0) {
-      if (markers[stopId]) { markers[stopId].remove(); delete markers[stopId]; }
-      continue;
-    }
+    const active = upcoming.length > 0;
     if (!markers[stopId]) {
-      markers[stopId] = L.marker([s.lat, s.lon], { icon: stopIcon }).addTo(map);
+      markers[stopId] = L.marker([s.lat, s.lon], { icon: active ? stopIcon : stopIconGrey }).addTo(map);
+    } else {
+      markers[stopId].setIcon(active ? stopIcon : stopIconGrey);
     }
     markers[stopId].bindPopup(buildPopup(stopId));
   }

@@ -17,7 +17,8 @@ fn is_active_window() -> bool {
         _ => {}
     }
     let h = now.hour();
-    (h >= 8 && h < 11) || (h >= 15 && h < 18)
+    let m = now.minute();
+    (h >= 8 && h < 11) || (h == 11 && m == 0) || (h >= 15 && h < 18) || (h == 18 && m == 0)
 }
 
 #[tokio::main]
@@ -138,6 +139,12 @@ async fn main() -> Result<()> {
 
     // Load full stop metadata (with coordinates) for the map
     let stops = Arc::new(db.get_all_stops().await?);
+
+    // Seed cache from last poll so the map is immediately usable after restart
+    if let Ok(Some((polled_at, departures))) = db.load_latest_poll().await {
+        tracing::info!(departures = departures.len(), "Seeded cache from last poll");
+        *cache.write().await = Some(bigbluebunch::models::PollResult { polled_at, departures });
+    }
 
     tracing::info!(
         stops = stop_ids.len(),
